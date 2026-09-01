@@ -26,7 +26,7 @@ Before configuring the widget, you need a system-level text-to-speech dependency
 The widget uses a dedicated Python virtual environment to run the AI voice models without interfering with your system Python packages.
 1. In the Voice settings tab, look at the **Status** section.
 2. If it says the engine is missing or damaged, click the **Repair Engine** button.
-3. A terminal window will open in the background to download and install the required Python packages (`faster-whisper`, `kokoro-onnx`, etc.). This may take a few minutes depending on your internet speed.
+3. The widget runs the setup in the background to download and install the required Python packages (`faster-whisper`, `kokoro-onnx`, etc.). This may take a few minutes depending on your internet speed.
 4. Once completed, the status should update to show that the environment is ready.
 
 ### Step 4: Configure GPU Acceleration (NVIDIA Only)
@@ -34,9 +34,9 @@ If you have an NVIDIA graphics card, you can significantly speed up voice proces
 1. Check the **GPU Usage (CUDA)** box in the settings.
 2. If the status says **GPU libraries: Missing**, click the **Repair Engine** button again.
 3. The system will download the GPU-enabled versions of PyTorch (which are heavy, around 3GB). This will take some time.
-4. Once completed, the status will show **GPU libraries: Installed**, and your voice processing will be drastically faster.
+4. Once completed, the status will show **GPU libraries: Installed**, and your voice processing will be faster. CPU mode remains supported when GPU acceleration is disabled or unavailable.
 
-*Note: AMD and Intel GPUs are not currently supported for this feature. If you do not have an NVIDIA GPU, leave this option unchecked.*
+*Note: AMD and Intel GPU acceleration is not currently configured. CPU mode works on systems without NVIDIA CUDA; leave this option unchecked there.*
 
 ### Step 5: Download the AI Models
 You don't need to manually hunt for models!
@@ -54,6 +54,8 @@ You don't need to manually hunt for models!
 - **Read Aloud (TTS)**: Click the speaker icon on any assistant message to have the AI read it out loud. 
 - **Stop Reading**: If you want to stop the AI from reading, you can click the **Stop button (■)** that appears in the status bar at the bottom of the chat while audio is playing.
 - **Auto-TTS**: If you want the AI to automatically read every new response, you can enable "Auto-TTS" in the settings.
+
+The optional STT/TTS daemons listen only on loopback and require a per-user token. The widget creates the token with mode `0600`; do not copy or share the token file.
 
 ## Troubleshooting
 

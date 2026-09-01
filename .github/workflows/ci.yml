@@ -28,4 +28,46 @@ jobs:
 
       - name: Run tests
         run: |
-          pytest
+          pytest -q
+
+      - name: Install QML tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-declarative-dev-tools
+
+      - name: Lint live QML and translation smoke-test sources
+        run: |
+          qmllint org.kde.plasma.kdeaichat/contents/ui/main.qml
+          qmllint org.kde.plasma.kdeaichat/contents/ui/FullRepresentationContent.qml
+          qmllint org.kde.plasma.kdeaichat/contents/ui/VoiceManager.qml
+          qmllint org.kde.plasma.kdeaichat/contents/ui/ConfigGeneral.qml
+          qmllint org.kde.plasma.kdeaichat/contents/ui/ConfigOther.qml
+          qmllint org.kde.plasma.kdeaichat/contents/ui/ConfigVoice.qml
+          qmllint org.kde.plasma.kdeaichat/contents/ui/ScheduleDialog.qml
+
+      - name: Verify a freshly built package contains the source tree
+        run: |
+          python - <<'PY'
+          import pathlib, tempfile, zipfile
+          root = pathlib.Path("org.kde.plasma.kdeaichat")
+          with tempfile.NamedTemporaryFile(suffix=".plasmoid") as f:
+              with zipfile.ZipFile(f.name, "w", zipfile.ZIP_DEFLATED) as archive:
+                  for path in root.rglob("*"):
+                      if path.is_file() and "__pycache__" not in path.parts and "translate/venv" not in str(path):
+                          archive.write(path, path.as_posix())
+              with zipfile.ZipFile(f.name) as archive:
+                  names = set(archive.namelist())
+                  required = [
+                      "org.kde.plasma.kdeaichat/metadata.json",
+                      "org.kde.plasma.kdeaichat/contents/ui/main.qml",
+                      "org.kde.plasma.kdeaichat/contents/ui/Security.js",
+                      "org.kde.plasma.kdeaichat/contents/ui/VoiceManager.qml",
+                      "org.kde.plasma.kdeaichat/contents/ui/kde_ai_helper.py",
+                      "org.kde.plasma.kdeaichat/contents/ui/voice/voice_helper.py",
+                      "org.kde.plasma.kdeaichat/contents/ui/translations.js",
+                  ]
+                  missing = [name for name in required if name not in names]
+                  if missing:
+                      raise SystemExit("package is missing: " + ", ".join(missing))
+          print("fresh package manifest verified")
+          PY

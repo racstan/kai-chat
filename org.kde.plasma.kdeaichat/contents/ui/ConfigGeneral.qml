@@ -7,6 +7,7 @@ import org.kde.kirigami as Kirigami
 import org.kde.plasma.plasma5support as P5Support
 import org.kde.plasma.workspace.dbus as DBus
 import "ProviderService.js" as ProviderService
+import "Security.js" as Sec
 
 KCM.SimpleKCM {
     id: page
@@ -88,6 +89,8 @@ KCM.SimpleKCM {
     // are populated after the combo's onCurrentIndexChanged fires).
     property bool pageReady: false
     property bool keyringBusy: false
+    property string keyringStatus: ""
+    property var availableWalletNames: []
     property bool openCodeBusy: utilityDs.connectedSources.filter(function(sourceName) {
         return sourceName.indexOf("#opencode-") >= 0;
     }).length > 0
@@ -213,7 +216,7 @@ KCM.SimpleKCM {
         for (var i = 0; i < list.length; i++) if (list[i] && list[i].id === id) return list[i];
         return null;
     }
-    function setCustomProviderProperty(id, key, value) {
+    function setCustomProviderProperty(id, key, value, persistConfig) {
         var list = [];
         try { list = JSON.parse(page.cfg_customProvidersJson || "[]"); } catch(e) { list = []; }
         var changed = false;
@@ -223,7 +226,8 @@ KCM.SimpleKCM {
         if (!changed) return;
         var json = JSON.stringify(list);
         page.cfg_customProvidersJson = json;
-        if (plasmoid && plasmoid.configuration) plasmoid.configuration.customProvidersJson = json;
+        if (persistConfig !== false && plasmoid && plasmoid.configuration)
+            plasmoid.configuration.customProvidersJson = json;
         // keep dropdown in sync without losing selection
         var cur = providerBox.currentValue;
         providerBox.model = page._buildProviderBoxModel();
@@ -239,18 +243,38 @@ KCM.SimpleKCM {
         return "kdewallet";
     }
 
+    function detectWallets() {
+        // Native DBus operations are the source of truth. Keep this small
+        // compatibility hook for old status callbacks.
+        keyringStatus = "KWallet status refreshed.";
+    }
+
     function walletCall(member, args, resolve, reject) {
-        var reply = DBus.SessionBus.asyncCall({
-            service: "org.kde.kwalletd6",
-            path: "/modules/kwalletd6",
-            iface: "org.kde.KWallet",
-            member: member,
-            arguments: args
-        });
+        var reply;
+        try {
+            reply = DBus.SessionBus.asyncCall({
+                service: "org.kde.kwalletd6",
+                path: "/modules/kwalletd6",
+                iface: "org.kde.KWallet",
+                member: member,
+                arguments: args
+            });
+        } catch (e) {
+            if (reject) reject(String(e));
+            else {
+                keyringBusy = false;
+                keyringStatus = "KWallet is unavailable: " + e;
+            }
+            return;
+        }
         reply.finished.connect(function() {
             if (reply.isError) {
                 if (reject) reject(reply.error);
-                else console.warn("KDE AI Chat: wallet DBus error:", member, reply.error);
+                else {
+                    keyringBusy = false;
+                    keyringStatus = "KWallet error while calling " + member + ".";
+                    console.warn("KDE AI Chat: wallet DBus error:", member, reply.error);
+                }
             } else {
                 var val = reply.value;
                 if (val !== null && val !== undefined && typeof val === 'object' && val.hasOwnProperty("value")) val = val.value;
@@ -286,16 +310,18 @@ KCM.SimpleKCM {
         if (urlStr.indexOf("file://") === 0)
             urlStr = urlStr.substring(7);
         var path = decodeURIComponent(urlStr);
-        if (path.indexOf("/") === 0 && path.indexOf("/contents/ui/") !== -1)
+        if (path.endsWith("/contents/ui/kde_ai_helper.py"))
             return path;
-        var localShare = StandardPaths.writableLocation(StandardPaths.GenericDataLocation);
-        return localShare + "/plasma/plasmoids/org.kde.plasma.kdeaichat/contents/ui/kde_ai_helper.py";
+        return "";
     }
 
     function copyToClipboard(textValue) {
         var text = textValue || "";
-        var cmd = "sh -lc \"if command -v wl-copy >/dev/null 2>&1; then printf '%s' '" + shellEscape(text) + "' | wl-copy; " + "elif command -v xclip >/dev/null 2>&1; then printf '%s' '" + shellEscape(text) + "' | xclip -selection clipboard; " + "else echo 'Clipboard tool missing: install wl-clipboard or xclip' 1>&2; exit 1; fi\"";
-        utilityDs.connectSource(cmd + " #clipboard-copy");
+        var arg = Sec.rawShellSnippetQuote(text);
+        var cmd = "if command -v wl-copy >/dev/null 2>&1; then printf '%s' " + arg + " | wl-copy; "
+            + "elif command -v xclip >/dev/null 2>&1; then printf '%s' " + arg + " | xclip -selection clipboard; "
+            + "else echo 'Clipboard tool missing: install wl-clipboard or xclip' 1>&2; exit 1; fi";
+        utilityDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #clipboard-copy-" + Date.now());
     }
 
     function providerEnabled(providerId) {
@@ -669,8 +695,13 @@ KCM.SimpleKCM {
     }
 
     function requestJson(url, headers, onSuccess, onError) {
+        var safeUrl = Sec.validateHttpUrl(url);
+        if (!safeUrl) {
+            onError("Request blocked: only HTTP(S) provider URLs are allowed.");
+            return;
+        }
         var xhr = new XMLHttpRequest();
-        xhr.open("GET", url, true);
+        xhr.open("GET", safeUrl, true);
         xhr.timeout = 15000;
         xhr.ontimeout = function() {
             onError("Request to " + url + " timed out after 15 seconds.");
@@ -956,9 +987,82 @@ KCM.SimpleKCM {
         });
     }
 
+    function notifyWalletChanged() {
+        if (hasPlasmoidConfig && plasmoid.configuration.walletKeysRevision !== undefined)
+            plasmoid.configuration.walletKeysRevision = (Number(plasmoid.configuration.walletKeysRevision) || 0) + 1;
+    }
+
+    function clearPlaintextApiKey(targetId) {
+        if (!hasPlasmoidConfig)
+            return;
+        var configKey = ProviderService.getApiKeyConfigKey(targetId);
+        if (configKey && plasmoid.configuration[configKey] !== undefined)
+            plasmoid.configuration[configKey] = "";
+        if (isCustomProviderId(targetId)) {
+            var list = [];
+            try { list = JSON.parse(page.cfg_customProvidersJson || "[]"); } catch (e) { list = []; }
+            var changed = false;
+            for (var i = 0; i < list.length; i++) {
+                if (list[i] && list[i].id === targetId && list[i].apiKey) {
+                    list[i].apiKey = "";
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed) {
+                var json = JSON.stringify(list);
+                page.cfg_customProvidersJson = json;
+                plasmoid.configuration.customProvidersJson = json;
+            }
+        }
+        notifyWalletChanged();
+    }
+
+    function clearPlaintextApiKeys() {
+        var ids = keyTargetIds();
+        for (var i = 0; i < ids.length; i++)
+            clearPlaintextApiKey(ids[i]);
+    }
+
     function saveKey(targetId, value) {
         var val = (value || "").trim();
+        if (val === "") {
+            kwalletRemove(targetId);
+            return;
+        }
         kwalletStore(targetId, val, false);
+    }
+
+    function kwalletRemove(targetId) {
+        var walletName = effectiveWalletName();
+        var keyName = "kai-chat-" + targetId + "-api-key";
+        keyringBusy = true;
+        walletCall("wallets", [], function(wallets) {
+            if (!wallets || wallets.indexOf(walletName) === -1) { keyringBusy = false; return; }
+            walletCall("open", [walletName, new DBus.int64(0), walletAppId], function(handle) {
+                if (handle < 0) { keyringBusy = false; return; }
+                walletCall("hasFolder", [new DBus.int32(handle), walletFolderName, walletAppId], function(hasFolder) {
+                    if (!hasFolder) {
+                        walletCall("close", [new DBus.int32(handle), new DBus.bool(false), walletAppId]);
+                        keyringBusy = false;
+                        return;
+                    }
+                    walletCall("hasEntry", [new DBus.int32(handle), walletFolderName, keyName, walletAppId], function(hasEntry) {
+                        if (hasEntry)
+                            walletCall("removeEntry", [new DBus.int32(handle), walletFolderName, keyName, walletAppId], function() {
+                                walletCall("close", [new DBus.int32(handle), new DBus.bool(false), walletAppId]);
+                                keyringBusy = false;
+                                clearPlaintextApiKey(targetId);
+                                keyringStatus = "Removed key for " + targetId + " from KWallet.";
+                            });
+                        else {
+                            walletCall("close", [new DBus.int32(handle), new DBus.bool(false), walletAppId]);
+                            keyringBusy = false;
+                        }
+                    });
+                });
+            });
+        });
     }
 
     function kwalletLoad(targetId, isBulk) {
@@ -1034,6 +1138,8 @@ KCM.SimpleKCM {
             maritacaApiKeyField.text = normalized;
         else if (targetId === "perplexity")
             perplexityApiKeyField.text = normalized;
+        else if (isCustomProviderId(targetId))
+            setCustomProviderProperty(targetId, "apiKey", normalized, false);
         var after = apiKeyForTarget(targetId);
         if (before !== after && providerBox.currentValue === targetId)
             refreshCurrentProviderModels();
@@ -1041,7 +1147,15 @@ KCM.SimpleKCM {
     }
 
     function keyTargetIds() {
-        return ["openai", "anthropic", "groq", "deepseek", "minimax", "fireworks", "google", "openrouter", "mistral", "cloudflare", "nvidia", "huggingface", "xai", "litellm", "maritaca", "perplexity"];
+        var ids = ["openai", "anthropic", "groq", "deepseek", "minimax", "fireworks", "google", "openrouter", "mistral", "cloudflare", "nvidia", "huggingface", "xai", "litellm", "maritaca", "perplexity"];
+        var customs = [];
+        try { customs = JSON.parse(page.cfg_customProvidersJson || "[]"); } catch (e) { customs = []; }
+        for (var i = 0; i < customs.length; i++) {
+            var id = customs[i] && String(customs[i].id || "");
+            if (/^custom_[A-Za-z0-9._:-]{1,100}$/.test(id) && ids.indexOf(id) < 0)
+                ids.push(id);
+        }
+        return ids;
     }
 
     function apiKeyForTarget(targetId) {
@@ -1093,6 +1207,10 @@ KCM.SimpleKCM {
         if (targetId === "perplexity")
             return perplexityApiKeyField.text;
 
+        if (isCustomProviderId(targetId)) {
+            var custom = customProviderById(targetId);
+            return custom ? (custom.apiKey || "") : "";
+        }
         return "";
     }
 
@@ -1146,7 +1264,9 @@ KCM.SimpleKCM {
         var ids = keyTargetIds();
         for (var i = 0; i < ids.length; i++) {
             var value = (apiKeyForTarget(ids[i]) || "").trim();
-            if (value !== "") targetsToSave.push({id: ids[i], val: value});
+            // Include empty fields so keys removed in Settings are also
+            // removed from KWallet rather than silently lingering.
+            targetsToSave.push({id: ids[i], val: value});
         }
         
         if (targetsToSave.length === 0) {
@@ -1166,13 +1286,19 @@ KCM.SimpleKCM {
                             if (idx >= targetsToSave.length) {
                                 walletCall("close", [new DBus.int32(handle), new DBus.bool(false), walletAppId]);
                                 keyringBusy = false;
+                                clearPlaintextApiKeys();
                                 keyringStatus = "Synced " + targetsToSave.length + " API keys to KWallet.";
                                 return;
                             }
                             var t = targetsToSave[idx++];
                             var key = "kai-chat-" + t.id + "-api-key";
-                            walletCall("writePassword", [new DBus.int32(handle), walletFolderName, key, t.val, walletAppId], function() {
-                                saveNext();
+                            var member = t.val === "" ? "removeEntry" : "writePassword";
+                            var args = t.val === ""
+                                ? [new DBus.int32(handle), walletFolderName, key, walletAppId]
+                                : [new DBus.int32(handle), walletFolderName, key, t.val, walletAppId];
+                            walletCall("hasEntry", [new DBus.int32(handle), walletFolderName, key, walletAppId], function(hasEntry) {
+                                if (t.val === "" && !hasEntry) { saveNext(); return; }
+                                walletCall(member, args, function() { saveNext(); });
                             });
                         }
                         saveNext();
@@ -1186,6 +1312,35 @@ KCM.SimpleKCM {
                 });
             });
         });
+    }
+
+    function loadPlaintextApiKeyFallbacks() {
+        if (!hasPlasmoidConfig)
+            return;
+        var fields = {
+            "openai": apiKeyField,
+            "anthropic": anthropicApiKeyField,
+            "groq": groqApiKeyField,
+            "deepseek": deepSeekApiKeyField,
+            "minimax": miniMaxApiKeyField,
+            "fireworks": fireworksApiKeyField,
+            "google": googleApiKeyField,
+            "openrouter": openRouterApiKeyField,
+            "mistral": mistralApiKeyField,
+            "cloudflare": cloudflareApiKeyField,
+            "nvidia": nvidiaApiKeyField,
+            "huggingface": huggingFaceApiKeyField,
+            "xai": xaiApiKeyField,
+            "litellm": litellmApiKeyField,
+            "maritaca": maritacaApiKeyField,
+            "perplexity": perplexityApiKeyField
+        };
+        var ids = Object.keys(fields);
+        for (var i = 0; i < ids.length; i++) {
+            var configKey = ProviderService.getApiKeyConfigKey(ids[i]);
+            if (configKey && !fields[ids[i]].text)
+                fields[ids[i]].text = String(plasmoid.configuration[configKey] || "");
+        }
     }
 
     function clearAllApiKeyFields() {
@@ -1265,7 +1420,6 @@ KCM.SimpleKCM {
         plasmoid.configuration.piModel = piModelValueField.text;
         plasmoid.configuration.openCodeStartCommand = openCodeStartCommandField.text;
         plasmoid.configuration.openCodeStopCommand = openCodeStopCommandField.text;
-        plasmoid.configuration.kwalletName = walletNameField.text;
     }
 
     function cancelKeyringOps() {
@@ -1376,8 +1530,14 @@ KCM.SimpleKCM {
         var cmd = "python3 " + quoteForShell(getHelperPath()) + " get_memory_usage";
         utilityDs.connectSource(cmd + " #mem-usage-" + Date.now());
 
-        // Mark page as fully initialised
+        // Show a legacy plaintext value while KWallet is being queried, then
+        // replace it with the wallet value when available.
+        loadPlaintextApiKeyFallbacks();
+        // Load secrets from KWallet after the form has initialized. The
+        // ordinary KConfig values remain only as a migration fallback; the
+        // live widget prefers its in-memory wallet copy.
         pageReady = true;
+        Qt.callLater(page.kwalletLoadAll);
     }
     Component.onDestruction: {
         saveGeneralSettingsOnly();
@@ -1395,7 +1555,9 @@ KCM.SimpleKCM {
     }
 
     P5Support.DataSource {
-    // keyringDs removed in favor of native DBus calls.
+        id: keyringDs
+        engine: "executable"
+        connectedSources: []
     }
 
     P5Support.DataSource {
@@ -1422,10 +1584,8 @@ KCM.SimpleKCM {
                 else
                     Qt.callLater(page.kwalletLoadAll);
             } else if (sourceName.indexOf("kwallet-refresh-all") >= 0) {
-                console.log("[KAI-DEBUG] kwallet-refresh-all stdout:", out);
-                console.log("[KAI-DEBUG] kwallet-refresh-all stderr:", err);
+                console.log("KWallet refresh response received (stdout/stderr lengths):", out.length, err.length);
                 if (out.indexOf("__KAI_BULK__:") < 0) {
-                    console.log("[KAI-DEBUG] kwallet-refresh-all not finished yet, waiting...");
                     return ;
                 }
                 if (out === "__KAI_BULK__:NO_WALLET") {
@@ -2046,6 +2206,15 @@ KCM.SimpleKCM {
 
                 visible: false
                 text: "kdeaichatwallet"
+            }
+
+            QQC2.Label {
+                visible: !openCodeToggle.checked && !piToggle.checked
+                Layout.fillWidth: true
+                Layout.maximumWidth: formLayout.fieldMaxWidth
+                wrapMode: Text.Wrap
+                text: keyringBusy ? i18n("KWallet is handling API keys…") : (keyringStatus || i18n("API keys are stored in KWallet when it is available; existing KConfig values remain a compatibility fallback."))
+                opacity: 0.72
             }
 
             QQC2.TextField {
@@ -3334,12 +3503,13 @@ KCM.SimpleKCM {
                      QQC2.Button {
                          text: page.editingCustomProviderId ? i18n("Save Provider") : i18n("Add Provider")
                          icon.name: "list-add"
-                         enabled: newCpName.text.trim().length > 0 && newCpUrl.text.trim().length > 0
+                         enabled: newCpName.text.trim().length > 0 && Sec.validateHttpUrl(newCpUrl.text.trim()) !== ""
                          onClicked: {
                              var list = [];
                              try { list = JSON.parse(page.cfg_customProvidersJson || "[]"); } catch (e) { list = []; }
+                             var requestedId = String(page.editingCustomProviderId || "");
                              var entry = {
-                                 "id": page.editingCustomProviderId || ("custom_" + Date.now()),
+                                 "id": /^custom_[A-Za-z0-9._:-]{1,100}$/.test(requestedId) ? requestedId : ("custom_" + Date.now()),
                                  "name": newCpName.text.trim(),
                                  "type": newCpType.currentText,
                                  "baseUrl": newCpUrl.text.trim(),
@@ -3356,6 +3526,10 @@ KCM.SimpleKCM {
                             if (plasmoid && plasmoid.configuration) {
                                 plasmoid.configuration.customProvidersJson = JSON.stringify(list);
                             }
+                            if (entry.apiKey)
+                                page.kwalletStore(entry.id, entry.apiKey, false);
+                            else
+                                page.kwalletRemove(entry.id);
                             providerBox.model = page._buildProviderBoxModel();
                             for (var j = 0; j < providerBox.model.length; j++) {
                                 if (providerBox.model[j].value === oldVal) {
@@ -3439,11 +3613,14 @@ KCM.SimpleKCM {
                                 onClicked: {
                                     var oldVal = providerBox.currentValue;
                                     var list = JSON.parse(page.cfg_customProvidersJson || "[]");
+                                    var removedId = list[index] && list[index].id ? String(list[index].id) : "";
                                     list.splice(index, 1);
                                     page.cfg_customProvidersJson = JSON.stringify(list);
                                     if (plasmoid && plasmoid.configuration) {
                                         plasmoid.configuration.customProvidersJson = JSON.stringify(list);
                                     }
+                                    if (removedId)
+                                        page.kwalletRemove(removedId);
                                     providerBox.model = page._buildProviderBoxModel();
                                     for (var j = 0; j < providerBox.model.length; j++) {
                                         if (providerBox.model[j].value === oldVal) {

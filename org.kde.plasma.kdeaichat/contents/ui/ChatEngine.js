@@ -249,7 +249,7 @@ let payload = {
 "currentB64": b64Current
 };
 let b64Payload = base64Encode(JSON.stringify(payload));
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " migrate_history " + Sec.quoteForShell(b64Payload);
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " migrate_history " + Sec.rawShellSnippetQuote(b64Payload);
 customStorageDs.connectSource(cmd + " #migrate-history-" + Date.now());
 }
 
@@ -271,13 +271,13 @@ let b64 = base64Encode(jsonStr);
 let dataDir = StandardPaths.writableLocation(StandardPaths.GenericDataLocation) + "/kdeaichat";
 let sessionsFile = dataDir + "/sessions.json";
 let writeCmd = "mkdir -p " + Sec.quoteForShell(dataDir)
-    + " && echo " + Sec.quoteForShell(b64)
+    + " && echo " + Sec.rawShellSnippetQuote(b64)
     + " | base64 -d > " + Sec.quoteForShell(sessionsFile);
 customStorageDs.connectSource(writeCmd + " #sessions-write-" + Date.now());
 let customDir = (plasmoid.configuration.customHistoryPath || "").trim();
 if (customDir !== "") {
 let fullPath = getHistoryFilePath(customDir);
-let writeCmd2 = "echo " + Sec.quoteForShell(b64)
+let writeCmd2 = "echo " + Sec.rawShellSnippetQuote(b64)
     + " | base64 -d > " + Sec.quoteForShell(fullPath);
 customStorageDs.connectSource(writeCmd2 + " #custom-history-write-" + Date.now());
 }
@@ -612,8 +612,8 @@ let payload = {
 "sessionId": sessionId
 };
 let b64Payload = base64Encode(JSON.stringify(payload));
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " delete_session_schedules " + Sec.quoteForShell(b64Payload);
-schedulerDs.connectSource("sh -c " + Sec.quoteForShell(cmd) + " #sched-session-delete-" + Date.now());
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " delete_session_schedules " + Sec.rawShellSnippetQuote(b64Payload);
+schedulerDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #sched-session-delete-" + Date.now());
 // Also update root.schedulesList locally
 let copy = root.schedulesList.filter(function(s) {
 return s.chatId !== sessionId;
@@ -3417,7 +3417,7 @@ let payload = {
 };
 let b64Payload = base64Encode(JSON.stringify(payload));
 let safeFilePath = Sec.sanitizeForShell(filePath);
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " export_chat " + Sec.quoteForShell(b64Payload) + " && notify-send -i document-export " + Sec.quoteForShell("KDE AI Chat") + " " + Sec.quoteForShell("Chat session successfully exported to " + safeFilePath);
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " export_chat " + Sec.rawShellSnippetQuote(b64Payload) + " && notify-send -i document-export " + Sec.quoteForShell("KDE AI Chat") + " " + Sec.quoteForShell("Chat session successfully exported to " + safeFilePath);
 fileReaderDs.connectSource(cmd + " #export-chat-save");
 }
 
@@ -3564,6 +3564,8 @@ function resetVoiceIdleTimer() {
 function ensureVoiceDaemonRunning(port, onStarted) {
     let xhr = new XMLHttpRequest();
     xhr.open("GET", "http://127.0.0.1:" + port + "/status", true);
+    if (root.voiceManagerRef && root.voiceManagerRef.httpToken)
+        xhr.setRequestHeader("X-KDE-AI-Chat-Token", root.voiceManagerRef.httpToken);
     xhr.onreadystatechange = function() {
         if (xhr.readyState === XMLHttpRequest.DONE) {
             if (xhr.status === 200) {
@@ -3606,6 +3608,8 @@ function sendVoiceCommand(port, payload, fallbackSource) {
     let xhr = new XMLHttpRequest();
     xhr.open("POST", "http://127.0.0.1:" + port + "/command", true);
     xhr.setRequestHeader("Content-Type", "application/json");
+    if (root.voiceManagerRef && root.voiceManagerRef.httpToken)
+        xhr.setRequestHeader("X-KDE-AI-Chat-Token", root.voiceManagerRef.httpToken);
     xhr.onreadystatechange = function() {
         if (xhr.readyState === XMLHttpRequest.DONE) {
             if (xhr.status === 200) {
@@ -4034,8 +4038,8 @@ let payload = {
 "status": errorMsg
 };
 let b64Payload = base64Encode(JSON.stringify(payload));
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " update_schedule_history_status " + Sec.quoteForShell(b64Payload);
-soundDs.connectSource("sh -c " + Sec.quoteForShell(cmd) + " #sched-history-err");
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " update_schedule_history_status " + Sec.rawShellSnippetQuote(b64Payload);
+soundDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #sched-history-err");
 }
 }
 
@@ -5097,8 +5101,8 @@ let payload = {
 "enabled": newEnabled
 };
 let b64Payload = base64Encode(JSON.stringify(payload));
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " toggle_schedule " + Sec.quoteForShell(b64Payload);
-schedulerDs.connectSource("sh -c " + Sec.quoteForShell(cmd) + " #sched-toggle-" + Date.now());
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " toggle_schedule " + Sec.rawShellSnippetQuote(b64Payload);
+schedulerDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #sched-toggle-" + Date.now());
 // Update local schedulesList immediately
 let copy = root.schedulesList.slice();
 for (let i = 0; i < copy.length; i++) {
@@ -5150,8 +5154,8 @@ let historyPayload = {
 "status": errMsg
 };
 let b64HistoryPayload = base64Encode(JSON.stringify(historyPayload));
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " update_schedule_history_status " + Sec.quoteForShell(b64HistoryPayload);
-soundDs.connectSource("sh -c " + Sec.quoteForShell(cmd) + " #sched-history-err");
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " update_schedule_history_status " + Sec.rawShellSnippetQuote(b64HistoryPayload);
+soundDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #sched-history-err");
 }
 }
 );
@@ -5179,8 +5183,8 @@ let historyPayload = {
 "status": validationError
 };
 let b64HistoryPayload = base64Encode(JSON.stringify(historyPayload));
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " update_schedule_history_status " + Sec.quoteForShell(b64HistoryPayload);
-soundDs.connectSource("sh -c " + Sec.quoteForShell(cmd) + " #sched-history-err");
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " update_schedule_history_status " + Sec.rawShellSnippetQuote(b64HistoryPayload);
+soundDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #sched-history-err");
 }
 return ;
 }

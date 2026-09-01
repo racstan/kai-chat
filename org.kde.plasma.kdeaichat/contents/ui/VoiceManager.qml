@@ -11,7 +11,13 @@ Item {
     property string currentPlayingChunk: ""
     property string statusText: ""
     property string lastRecognizedText: ""
-    readonly property string defaultSttModel: ""
+    readonly property string defaultSttModel: "small"
+    property string httpToken: ""
+    property bool httpTokenRequestInProgress: false
+    property string httpTokenRequestSource: ""
+    property var pendingHttpCommands: []
+    property var sttStatusXhr: null
+    property var ttsStatusXhr: null
     
     // Config aliases for convenience
     property bool enabled: plasmoid.configuration.voiceEnabled || false
@@ -24,10 +30,10 @@ Item {
         let isTtsEnabled = plasmoid.configuration.voiceTtsEnabled || false;
         if (!isVoiceEnabled) {
             let killCmd = "systemctl --user disable --now kde-ai-stt.service 2>/dev/null; systemctl --user disable --now kde-ai-tts.service 2>/dev/null; pkill -f 'voice_helper.py --stt-server' 2>/dev/null; pkill -f 'voice_helper.py --tts-server' 2>/dev/null";
-            voiceDs.connectSource("sh -c " + Sec.quoteForShell(killCmd) + " #startup-sync-voice-off-" + Date.now());
+            voiceDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(killCmd) + " #startup-sync-voice-off-" + Date.now());
         } else if (!isTtsEnabled) {
             let killCmd = "systemctl --user disable --now kde-ai-tts.service 2>/dev/null; pkill -f 'voice_helper.py --tts-server' 2>/dev/null";
-            voiceDs.connectSource("sh -c " + Sec.quoteForShell(killCmd) + " #startup-sync-tts-off-" + Date.now());
+            voiceDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(killCmd) + " #startup-sync-tts-off-" + Date.now());
         }
     }
     
@@ -35,6 +41,11 @@ Item {
     signal errorOccurred(string errorText)
     signal envChecked(var result)
     signal setupStatus(string status)
+
+    Component.onDestruction: {
+        try { if (root.sttStatusXhr) root.sttStatusXhr.abort(); } catch (e) {}
+        try { if (root.ttsStatusXhr) root.ttsStatusXhr.abort(); } catch (e) {}
+    }
 
     readonly property alias voiceDs: voiceDs
 
@@ -45,7 +56,11 @@ Item {
         onNewData: function(sourceName, data) {
             let stdout = (data["stdout"] || "").trim();
             disconnectSource(sourceName);
-            if (stdout === "") return;
+            if (stdout === "") {
+                if (sourceName === root.httpTokenRequestSource)
+                    root._fallbackPendingHttpCommands();
+                return;
+            }
             let lines = stdout.split("\n");
             for (let i = 0; i < lines.length; i++) {
                 let line = lines[i].trim();
@@ -64,11 +79,18 @@ Item {
         repeat: true
         running: root.isRecording || root.isPlaying
         onTriggered: {
-            if (root.isRecording) {
+            if (root.isRecording && !root.sttStatusXhr) {
                 let xhr = new XMLHttpRequest();
+                root.sttStatusXhr = xhr;
                 xhr.open("GET", "http://127.0.0.1:9015/status", true);
+                if (root.httpToken)
+                    xhr.setRequestHeader("X-KDE-AI-Chat-Token", root.httpToken);
+                xhr.timeout = 2000;
                 xhr.onreadystatechange = function() {
-                    if (xhr.readyState === XMLHttpRequest.DONE && xhr.status === 200) {
+                    if (xhr.readyState !== XMLHttpRequest.DONE)
+                        return;
+                    if (root.sttStatusXhr === xhr) root.sttStatusXhr = null;
+                    if (xhr.status === 200) {
                         try {
                             let resp = JSON.parse(xhr.responseText);
                             if (resp.status === "recording") {
@@ -77,22 +99,31 @@ Item {
                                 root.statusText = "Transcribing... [" + (resp.stt_device ? resp.stt_device.toUpperCase() : "CPU") + "]";
                             } else if (resp.status === "idle" && root.isRecording) {
                                 // Likely finished or errored
-                                if (resp.stt_result && resp.stt_result.type === "stt_result") {
+                                if (resp.stt_result && (resp.stt_result.type === "stt_result" || resp.stt_result.type === "stt_error"))
                                     handleResponse(resp.stt_result, "http_poll");
-                                } else if (resp.stt_result && resp.stt_result.type === "stt_error") {
-                                    handleResponse(resp.stt_result, "http_poll");
-                                }
                             }
                         } catch(e) {}
+                    } else if (xhr.status === 401 || xhr.status === 403) {
+                        root.httpToken = "";
+                        root._requestHttpToken();
                     }
-                }
-                xhr.send();
+                };
+                xhr.ontimeout = function() { if (root.sttStatusXhr === xhr) root.sttStatusXhr = null; };
+                xhr.onerror = function() { if (root.sttStatusXhr === xhr) root.sttStatusXhr = null; };
+                try { xhr.send(); } catch (e) { if (root.sttStatusXhr === xhr) root.sttStatusXhr = null; }
             }
-            if (root.isPlaying) {
+            if (root.isPlaying && !root.ttsStatusXhr) {
                 let xhr = new XMLHttpRequest();
+                root.ttsStatusXhr = xhr;
                 xhr.open("GET", "http://127.0.0.1:9016/status", true);
+                if (root.httpToken)
+                    xhr.setRequestHeader("X-KDE-AI-Chat-Token", root.httpToken);
+                xhr.timeout = 2000;
                 xhr.onreadystatechange = function() {
-                    if (xhr.readyState === XMLHttpRequest.DONE && xhr.status === 200) {
+                    if (xhr.readyState !== XMLHttpRequest.DONE)
+                        return;
+                    if (root.ttsStatusXhr === xhr) root.ttsStatusXhr = null;
+                    if (xhr.status === 200) {
                         try {
                             let resp = JSON.parse(xhr.responseText);
                             if (resp.status === "playing") {
@@ -102,18 +133,23 @@ Item {
                                 root.currentPlayingChunk = "";
                                 root.statusText = "Generating speech...";
                             } else if (resp.status === "idle" && root.isPlaying) {
-                                if (resp.tts_result && resp.tts_result.type === "tts_error") {
+                                if (resp.tts_result && (resp.tts_result.type === "tts_error" || resp.tts_result.type === "error"))
                                     handleResponse(resp.tts_result, "http_poll");
-                                } else {
+                                else {
                                     root.isPlaying = false;
                                     root.currentPlayingChunk = "";
                                     root.statusText = "";
                                 }
                             }
                         } catch(e) {}
+                    } else if (xhr.status === 401 || xhr.status === 403) {
+                        root.httpToken = "";
+                        root._requestHttpToken();
                     }
-                }
-                xhr.send();
+                };
+                xhr.ontimeout = function() { if (root.ttsStatusXhr === xhr) root.ttsStatusXhr = null; };
+                xhr.onerror = function() { if (root.ttsStatusXhr === xhr) root.ttsStatusXhr = null; };
+                try { xhr.send(); } catch (e) { if (root.ttsStatusXhr === xhr) root.ttsStatusXhr = null; }
             }
         }
     }
@@ -121,16 +157,38 @@ Item {
     Timer {
         id: retryTimer
         interval: 2500
-        property string retryPayload: ""
-        property int retryPort: 0
-        property int retries: 0
+        repeat: false
+        property var retryQueue: []
         onTriggered: {
-            sendHttpCommand(retryPayload, retryPort, retries + 1);
+            var queue = retryQueue || [];
+            if (queue.length === 0)
+                return;
+            var item = queue.shift();
+            retryQueue = queue;
+            sendHttpCommand(item.payload, item.port, item.retries + 1);
+            if (queue.length > 0)
+                restart();
         }
     }
 
     function handleResponse(resp, sourceName) {
-        if (resp.type === "env_check") {
+        if (resp.type === "voice_token") {
+            if (sourceName !== root.httpTokenRequestSource)
+                return;
+            root.httpToken = String(resp.token || "");
+            root.httpTokenRequestInProgress = false;
+            root.httpTokenRequestSource = "";
+            if (!root.httpToken) {
+                root._fallbackPendingHttpCommands();
+                return;
+            }
+            let queued = root.pendingHttpCommands || [];
+            root.pendingHttpCommands = [];
+            for (let i = 0; i < queued.length; i++)
+                root._sendHttpCommandNow(queued[i].payload, queued[i].port, queued[i].retries);
+        } else if (sourceName === root.httpTokenRequestSource) {
+            root._fallbackPendingHttpCommands();
+        } else if (resp.type === "env_check") {
             root.envChecked(resp);
         } else if (resp.type === "setup_status") {
             root.setupStatus(resp.status);
@@ -177,6 +235,12 @@ Item {
         } else if (resp.type === "tts_started") {
             root.isPlaying = true;
             root.statusText = "Generating speech...";
+        } else if (resp.type === "error") {
+            root.isRecording = false;
+            root.isPlaying = false;
+            root.currentPlayingChunk = "";
+            root.statusText = "";
+            root.errorOccurred(resp.error || "Voice command failed");
         } else if (resp.type === "stt_started") {
             root.isRecording = true;
         } else if (resp.type === "stt_stopped") {
@@ -197,50 +261,94 @@ Item {
     function getHelperPath() {
         let base = String(Qt.resolvedUrl("./voice/voice_helper.py"));
         if (base.indexOf("file://") === 0) base = base.substring(7);
-        return base;
+        return base.endsWith("/contents/ui/voice/voice_helper.py") ? base : "";
     }
 
-    function sendCommand(payload) {
+    function sendCommand(payload, tag) {
         let helperPath = getHelperPath();
         let venvPy = getVenvPython();
+        let encoded = Sec.base64Encode(payload || "");
         let safeVenvPy = venvPy.startsWith("~/") ? '"$HOME"' + Sec.quoteForShell(venvPy.substring(1)) : Sec.quoteForShell(venvPy);
-        let cmd = "if [ -f " + safeVenvPy + " ]; then " + safeVenvPy + " " + Sec.quoteForShell(helperPath) + " --command-json " + Sec.quoteForShell(payload) + "; else python3 " + Sec.quoteForShell(helperPath) + " --command-json " + Sec.quoteForShell(payload) + "; fi";
-        voiceDs.connectSource("timeout 90s sh -c " + Sec.rawShellSnippetQuote(cmd) + " #voice-cmd-" + Date.now());
+        let encodedArg = Sec.rawShellSnippetQuote(encoded);
+        let cmd = "if [ -f " + safeVenvPy + " ]; then " + safeVenvPy + " " + Sec.quoteForShell(helperPath) + " --command-b64 " + encodedArg + "; else python3 " + Sec.quoteForShell(helperPath) + " --command-b64 " + encodedArg + "; fi";
+        let source = "timeout 90s sh -c " + Sec.rawShellSnippetQuote(cmd) + " #voice-" + (tag || "cmd") + "-" + Date.now();
+        voiceDs.connectSource(source);
+        return source;
     }
 
-    function sendHttpCommand(payload, port, retries) {
+    function _fallbackPendingHttpCommands() {
+        let queued = root.pendingHttpCommands || [];
+        root.pendingHttpCommands = [];
+        root.httpTokenRequestInProgress = false;
+        root.httpTokenRequestSource = "";
+        for (let i = 0; i < queued.length; i++)
+            sendCommand(queued[i].payload);
+    }
+
+    function _requestHttpToken() {
+        if (root.httpTokenRequestInProgress)
+            return;
+        root.httpTokenRequestInProgress = true;
+        root.httpTokenRequestSource = sendCommand(JSON.stringify({cmd: "get_http_token"}), "token");
+    }
+
+    function _sendHttpCommandNow(payload, port, retries) {
         if (retries === undefined) retries = 0;
         let xhr = new XMLHttpRequest();
-        xhr.open("POST", "http://127.0.0.1:" + port + "/command", true);
-        xhr.setRequestHeader("Content-Type", "application/json");
-        xhr.timeout = 300000; // 5 mins max
-        xhr.onreadystatechange = function() {
-            if (xhr.readyState === XMLHttpRequest.DONE) {
+        let completed = false;
+        let retryOrFallback = function() {
+            if (completed) return;
+            completed = true;
+            if (retries < 2) {
+                let serviceName = (port === 9015) ? "kde-ai-stt.service" : "kde-ai-tts.service";
+                voiceDs.connectSource("systemctl --user start " + serviceName + " #start-" + Date.now());
+                var retryQueue = retryTimer.retryQueue || [];
+                retryQueue.push({"payload": payload, "port": port, "retries": retries});
+                retryTimer.retryQueue = retryQueue;
+                if (!retryTimer.running)
+                    retryTimer.start();
+            } else {
+                sendCommand(payload);
+            }
+        };
+        try {
+            xhr.open("POST", "http://127.0.0.1:" + port + "/command", true);
+            xhr.setRequestHeader("Content-Type", "application/json");
+            xhr.setRequestHeader("X-KDE-AI-Chat-Token", root.httpToken);
+            xhr.timeout = 300000; // 5 mins max
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState !== XMLHttpRequest.DONE || completed)
+                    return;
                 if (xhr.status === 200) {
+                    completed = true;
                     try {
                         let resp = JSON.parse(xhr.responseText);
                         handleResponse(resp, "http");
                     } catch (e) {}
-                } else if (retries < 2) {
-                    // Try to start the daemon
-                    let serviceName = (port === 9015) ? "kde-ai-stt.service" : "kde-ai-tts.service";
-                    voiceDs.connectSource("systemctl --user start " + serviceName + " #start-" + Date.now());
-                    
-                    // Wait 2 seconds and retry using the dedicated timer
-                    retryTimer.retryPayload = payload;
-                    retryTimer.retryPort = port;
-                    retryTimer.retries = retries;
-                    retryTimer.start();
+                } else if (xhr.status === 401 || xhr.status === 403) {
+                    completed = true;
+                    root.httpToken = "";
+                    root.pendingHttpCommands = (root.pendingHttpCommands || []).concat([{"payload": payload, "port": port, "retries": retries}]);
+                    _requestHttpToken();
                 } else {
-                    sendCommand(payload);
+                    retryOrFallback();
                 }
-            }
-        }
-        try {
+            };
+            xhr.ontimeout = retryOrFallback;
+            xhr.onerror = retryOrFallback;
             xhr.send(payload);
         } catch (e) {
-            sendCommand(payload);
+            retryOrFallback();
         }
+    }
+
+    function sendHttpCommand(payload, port, retries) {
+        if (!root.httpToken) {
+            root.pendingHttpCommands = (root.pendingHttpCommands || []).concat([{"payload": payload, "port": port, "retries": retries === undefined ? 0 : retries}]);
+            _requestHttpToken();
+            return;
+        }
+        _sendHttpCommandNow(payload, port, retries);
     }
 
     function checkEnv() {
@@ -261,7 +369,7 @@ Item {
         if (base.indexOf("file://") === 0) base = base.substring(7);
         let venvPath = plasmoid.configuration.voiceVenvPath || "~/.local/share/kdeaichat/venv";
         let cmd = "NON_INTERACTIVE=1 bash " + Sec.quoteForShell(base) + " " + Sec.quoteForShell(venvPath);
-        voiceDs.connectSource("sh -c " + Sec.quoteForShell(cmd) + " #voice-setup-" + Date.now());
+        voiceDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #voice-setup-" + Date.now());
     }
 
     function startRecording() {

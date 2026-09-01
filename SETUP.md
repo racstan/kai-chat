@@ -65,9 +65,9 @@ All 17 providers follow the same pattern:
 2. **Obtain Your API Key:**
    - See [Provider Setup](#provider-setup) for provider-specific instructions
 
-3. **Enter the API Key (saved securely):**
+3. **Enter the API Key:**
    - Paste your API key in the **API Key** field
-   - The key is stored in the system Secret Service (encrypted)
+   - When KWallet is available, the key is stored in KDE Wallet (encrypted); otherwise it remains in the local plaintext configuration fallback
    - Click **Refresh Models** to discover models and verify connection
 
 4. **Configure API Endpoint (optional):**
@@ -640,7 +640,7 @@ rm ~/.local/share/plasmoids/org.kde.plasma.kdeaichat/conversations/{sessionId}.j
    kwalletmanager5
    ```
 
-3. If KWallet is not available on your system, the widget automatically falls back to storing keys securely in your standard local configuration file.
+3. If KWallet is not available on your system, the widget falls back to plaintext keys in the standard local configuration file. Use KWallet when at-rest secret protection is required.
 
 4. Re-enter your API key in Settings to verify and trigger synchronization.
 

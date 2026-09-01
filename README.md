@@ -26,7 +26,7 @@ A native, fast, and easy-to-use AI chat assistant widget for the **KDE Plasma 6*
 ## Key Features
 
 - **🛡️ OpenCode Developer Bridge**: Connect the widget to your local code workspace. Run code, search the web, and execute tasks directly from your desktop panel.
-- **🗣️ Local Voice Mode (STT & TTS) (Beta)**: Talk to the AI hands-free. Speaks out loud using local voice tools (configured via Python). Currently supports NVIDIA GPUs only (no AMD support). You can even highlight/select specific text in the chat and click the "Read Aloud" button to only read that selected part!
+- **🗣️ Local Voice Mode (STT & TTS) (Beta)**: Talk to the AI hands-free. Speaks out loud using local voice tools (configured via Python). CPU mode works broadly, with optional NVIDIA CUDA acceleration (AMD/Intel GPU acceleration is not currently configured). You can even highlight/select specific text in the chat and click the "Read Aloud" button to only read that selected part!
 - **📎 Drag & Drop Files**: Paste or drag images, PDFs, CSVs, Word documents, and text files directly into the chat. You can even send a file without typing any text.
 - **📝 Prompt Templates**: Save prompts you use often in the settings. Type `/<name>` in the chat to insert them instantly.
 - **📅 Task Scheduler**: Set up recurring tasks (like automated code checks or periodic reminders) using simple calendar schedules or cron expressions.

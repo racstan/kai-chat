@@ -564,6 +564,14 @@ function parseModelIds(responseObj) {
  * @param {function(string[]):void} onSuccess  Callback invoked with array of model IDs.
  * @param {function(string):void} onError  Callback invoked with error message string.
  */
+function isHttpUrlAllowed(url) {
+    if (url === null || url === undefined) return false;
+    let value = String(url).trim();
+    if (!/^(?:http|https):\/\//i.test(value) || /[\u0000-\u001f\u007f]/.test(value)) return false;
+    let authority = value.substring(value.indexOf("://") + 3).split(/[\/?#]/, 1)[0];
+    return authority !== "" && !/[\s<>"'`]/.test(authority) && authority.indexOf("@") < 0;
+}
+
 function fetchModelsForProvider(providerId, configuration, onSuccess, onError) {
     let cfg = getProviderConfig(providerId, configuration);
     let apiKeyKey = getApiKeyConfigKey(providerId);
@@ -601,8 +609,17 @@ function fetchModelsForProvider(providerId, configuration, onSuccess, onError) {
         }
     }
 
+    if (!isHttpUrlAllowed(url)) {
+        if (onError) onError("Request blocked: only HTTP(S) provider URLs are allowed.");
+        return;
+    }
     let xhr = new XMLHttpRequest();
-    xhr.open("GET", url, true);
+    try {
+        xhr.open("GET", url, true);
+    } catch (e) {
+        if (onError) onError("Invalid provider URL: " + e);
+        return;
+    }
     xhr.responseType = "text";
     xhr.timeout = 5000; // 5 second timeout — never hang plasmashell
     for (let h in headers) {
@@ -612,6 +629,8 @@ function fetchModelsForProvider(providerId, configuration, onSuccess, onError) {
         if (xhr.readyState !== XMLHttpRequest.DONE) return;
         if (xhr.status >= 200 && xhr.status < 300) {
             try {
+                if (xhr.responseText.length > 2000000)
+                    throw new Error("model list response is too large");
                 let parsed = JSON.parse(xhr.responseText);
                 let ids = parseModelIds(parsed);
                 if (onSuccess) onSuccess(ids);

@@ -16,7 +16,64 @@ import tempfile
 import threading
 import time
 import base64
+import hmac
+import secrets
 import signal
+import fcntl
+import math
+
+
+MAX_HTTP_BODY = 1024 * 1024
+MAX_TTS_TEXT = 200000
+
+
+def default_token_path():
+    return os.path.expanduser("~/.local/share/kdeaichat/voice-http-token")
+
+
+def load_or_create_http_token(path=""):
+    """Read the private loopback API token, creating it securely if needed."""
+    token_path = os.path.abspath(os.path.expanduser(path or default_token_path()))
+    if "\x00" in token_path or "\n" in token_path or "\r" in token_path:
+        raise ValueError("invalid voice token path")
+    folder = os.path.dirname(token_path)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    try: os.chmod(folder, 0o700)
+    except OSError: pass
+    lock_path = token_path + ".lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            with open(token_path, "r", encoding="ascii") as f:
+                token = f.read().strip()
+            if len(token) >= 32 and all(c.isalnum() or c in "_-" for c in token):
+                os.chmod(token_path, 0o600)
+                return token
+        except (OSError, UnicodeError):
+            pass
+
+        token = secrets.token_urlsafe(32)
+        fd, temporary = tempfile.mkstemp(prefix="." + os.path.basename(token_path) + ".", dir=folder)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="ascii") as f:
+                f.write(token + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, token_path)
+            os.chmod(token_path, 0o600)
+        except Exception:
+            try: os.close(fd)
+            except OSError: pass
+            try: os.unlink(temporary)
+            except OSError: pass
+            raise
+        return token
+    finally:
+        try: fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally: os.close(lock_fd)
 
 
 class VoiceHelper:
@@ -39,8 +96,11 @@ class VoiceHelper:
         self.tts_result = None
         self.current_status = "idle"
         self.current_countdown = 0
-        self.temp_audio_path = os.path.join(tempfile.gettempdir(), "kdeaichat_stt_test.wav")
+        # Set to a per-recording, mode-0600 temporary file while a result is
+        # being produced. Do not expose a predictable shared recording path.
+        self.temp_audio_path = ""
         self._nvidia_libs_preloaded = False
+        self.http_server = None
 
     def _preload_nvidia_libs(self):
         """Pre-load CUDA/cuDNN libraries from venv if present to prevent version mismatches."""
@@ -120,6 +180,10 @@ class VoiceHelper:
                 pass
             
         return "kokoro-82m"
+
+    def get_http_token(self, payload):
+        """Return the token used to authenticate the local HTTP API."""
+        self.emit({"type": "voice_token", "token": load_or_create_http_token(payload.get("path", ""))})
 
     def check_env(self, payload):
         """Check environment for voice capabilities."""
@@ -318,11 +382,19 @@ class VoiceHelper:
         def do_stt():
             try:
                 # Fetch payload values locally to prevent enclosing scope assignment/UnboundLocalError
-                duration = payload.get("duration", 10)
-                language = payload.get("language", "en")
-                model_name = payload.get("model", "small")
-                custom_model_path = payload.get("model_path", "")
-                gpu_requested = payload.get("gpu_requested", False)
+                try:
+                    duration = float(payload.get("duration", 10))
+                except (TypeError, ValueError):
+                    duration = 10.0
+                if not math.isfinite(duration):
+                    duration = 10.0
+                # Zero means "until stopped" in the UI, but still enforce a
+                # five-minute safety ceiling to bound captured audio memory.
+                duration = max(0.0, min(300.0, duration))
+                language = str(payload.get("language", "en"))[:16]
+                model_name = str(payload.get("model", "small"))[:128]
+                custom_model_path = str(payload.get("model_path", ""))[:4096]
+                gpu_requested = payload.get("gpu_requested", False) is True
 
                 # Check microphone
                 try:
@@ -408,11 +480,12 @@ class VoiceHelper:
                 sample_rate = 16000
                 all_audio = []
                 total_recorded = 0.0
+                recording_limit = duration if duration > 0 else 300.0
 
                 with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
                     chunk_duration = 0.1  # Check stop_recording every 100ms
                     chunk_frames = int(chunk_duration * sample_rate)
-                    while (duration <= 0 or total_recorded < duration) and not self.stop_recording:
+                    while total_recorded < recording_limit and not self.stop_recording:
                         if os.path.exists(stop_stt_file):
                             self.stop_recording = True
                             break
@@ -432,13 +505,16 @@ class VoiceHelper:
                 # Concatenate and transcribe
                 audio = np.concatenate(all_audio)
 
-                # Save audio to temp file
-                audio_path = self.temp_audio_path
+                # Save audio to a per-recording private temp file.
+                fd, audio_path = tempfile.mkstemp(prefix="kdeaichat_stt_", suffix=".wav")
+                os.close(fd)
+                os.chmod(audio_path, 0o600)
+                self.temp_audio_path = audio_path
                 sf.write(audio_path, audio, sample_rate)
 
                 # Skip very short audio
                 if len(audio) < sample_rate * 0.5:
-                    self.emit({"type": "stt_result", "text": "", "duration": total_recorded, "audio_path": audio_path})
+                    self.emit({"type": "stt_result", "text": "", "duration": total_recorded})
                     self.recording = False
                     return
 
@@ -455,7 +531,6 @@ class VoiceHelper:
                     "text": text,
                     "duration": total_recorded,
                     "language": info.language if hasattr(info, "language") else language,
-                    "audio_path": audio_path,
                     "device": self.stt_device,
                 })
 
@@ -465,6 +540,10 @@ class VoiceHelper:
                 self.recording = False
                 self.current_status = "idle"
                 self.current_countdown = 0
+                if self.temp_audio_path:
+                    try: os.unlink(self.temp_audio_path)
+                    except OSError: pass
+                    self.temp_audio_path = ""
 
         self.stt_thread = threading.Thread(target=do_stt, daemon=True)
         self.stt_thread.start()
@@ -475,7 +554,10 @@ class VoiceHelper:
             self.stop_recording = True
             self.emit({"type": "stt_status", "status": "stopping"})
         else:
-            open(os.path.join(tempfile.gettempdir(), "kdeaichat_stop_stt"), "w").close()
+            marker = os.path.join(tempfile.gettempdir(), "kdeaichat_stop_stt")
+            with open(marker, "a", encoding="ascii"):
+                pass
+            os.chmod(marker, 0o600)
             self.emit({"type": "stt_stopped"})
 
     def play_audio(self, payload):
@@ -517,12 +599,13 @@ class VoiceHelper:
         self.stop_tts = False
 
         def do_tts():
+            temporary_audio_paths = []
             try:
                 stop_tts_file = os.path.join(tempfile.gettempdir(), "kdeaichat_stop_tts")
                 if os.path.exists(stop_tts_file):
                     try: os.remove(stop_tts_file)
                     except OSError: pass
-                raw_text = payload.get("text", "")
+                raw_text = str(payload.get("text", ""))[:MAX_TTS_TEXT]
                 import re
                 def clean_text_for_tts(t):
                     # Remove code blocks
@@ -552,14 +635,16 @@ class VoiceHelper:
                     return t.strip()
 
                 text = clean_text_for_tts(raw_text)
-                voice = payload.get("voice", "")
+                if len(text) > MAX_TTS_TEXT:
+                    text = text[:MAX_TTS_TEXT]
+                voice = str(payload.get("voice", ""))[:256]
                 if not voice:
                     voice = "af_bella"
-                lang_code = payload.get("lang_code", "a")
-                custom_model_path = payload.get("model_path", "")
-                espeak_path = payload.get("espeak_path", "")
-                gpu_requested = payload.get("gpu_requested", False)
-                model = payload.get("model", "")
+                lang_code = str(payload.get("lang_code", "a"))[:16]
+                custom_model_path = str(payload.get("model_path", ""))[:4096]
+                espeak_path = str(payload.get("espeak_path", ""))[:4096]
+                gpu_requested = payload.get("gpu_requested", False) is True
+                model = str(payload.get("model", ""))[:64]
                 if not model:
                     model = self._detect_tts_model_type(custom_model_path)
 
@@ -602,12 +687,13 @@ class VoiceHelper:
                     espeak_voice = voice if voice and not voice.startswith("af_") and not voice.startswith("bf_") else "en-us"
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                         tmp_path = f.name
+                    temporary_audio_paths.append(tmp_path)
 
                     cmd = ["espeak-ng"]
                     if espeak_voice:
                         cmd.extend(["-v", espeak_voice])
-                    cmd.extend(["-w", tmp_path, text])
-                    subprocess.run(cmd, check=True)
+                    cmd.extend(["-w", tmp_path, "--", text])
+                    subprocess.run(cmd, check=True, timeout=60)
 
                     self.current_status = "playing"
                     self.tts_device = "cpu"
@@ -660,6 +746,7 @@ class VoiceHelper:
 
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                         tmp_path = f.name
+                    temporary_audio_paths.append(tmp_path)
 
                     piper_bin = shutil.which("piper")
                     if not piper_bin:
@@ -673,9 +760,16 @@ class VoiceHelper:
                             [piper_bin, "--model", model_path, "--output_file", tmp_path],
                             stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
                         )
-                        proc.communicate(input=text.encode("utf-8"))
+                        try:
+                            proc.communicate(input=text.encode("utf-8"), timeout=60)
+                        except subprocess.TimeoutExpired:
+                            try: os.killpg(proc.pid, signal.SIGKILL)
+                            except (OSError, ProcessLookupError): proc.kill()
+                            proc.wait()
+                            raise TimeoutError("Piper synthesis timed out")
                     else:
                         try:
                             from piper import PiperVoice
@@ -732,6 +826,7 @@ class VoiceHelper:
 
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                         tmp_path = f.name
+                        temporary_audio_paths.append(tmp_path)
                         sf.write(tmp_path, wav, sr)
 
                     self.current_status = "playing"
@@ -771,6 +866,7 @@ class VoiceHelper:
 
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                         tmp_path = f.name
+                    temporary_audio_paths.append(tmp_path)
 
                     tts_voice = voice if voice and not voice.startswith("af_") and not voice.startswith("bf_") else "tts_models/en/ljspeech/glow-tts"
                     tts_instance = TTS(model_name=tts_voice)
@@ -966,6 +1062,7 @@ class VoiceHelper:
 
                                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                                         tmp_path = f.name
+                                        temporary_audio_paths.append(tmp_path)
                                         sf.write(tmp_path, audio, 24000)
 
                                     play_queue.put((tmp_path, para))
@@ -1001,6 +1098,7 @@ class VoiceHelper:
 
                                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                                             tmp_path = f.name
+                                            temporary_audio_paths.append(tmp_path)
                                             sf.write(tmp_path, audio, 24000)
 
                                         play_queue.put((tmp_path, para))
@@ -1015,6 +1113,9 @@ class VoiceHelper:
             except Exception as e:
                 self.emit({"type": "tts_error", "error": str(e)})
             finally:
+                for temporary_path in temporary_audio_paths:
+                    try: os.unlink(temporary_path)
+                    except OSError: pass
                 self.tts_playing = False
                 self.current_status = "idle"
 
@@ -1034,7 +1135,10 @@ class VoiceHelper:
                     pass
             self.emit({"type": "tts_status", "status": "stopping"})
         else:
-            open(os.path.join(tempfile.gettempdir(), "kdeaichat_stop_tts"), "w").close()
+            marker = os.path.join(tempfile.gettempdir(), "kdeaichat_stop_tts")
+            with open(marker, "a", encoding="ascii"):
+                pass
+            os.chmod(marker, 0o600)
             # Also terminate any background paplay processes spawned by our script
             try:
                 subprocess.run(["pkill", "-f", "paplay.*kdeaichat"], stderr=subprocess.DEVNULL)
@@ -1102,8 +1206,8 @@ class VoiceHelper:
         except Exception as e:
             return {"type": "error", "error": f"Exception in server command processor: {str(e)}"}
 
-    def run_http_server(self, port, mode):
-        """Run a simple multithreaded HTTP server on localhost."""
+    def run_http_server(self, port, mode, token_file=""):
+        """Run an authenticated, loopback-only HTTP server."""
         import http.server
         from http.server import HTTPServer
         try:
@@ -1111,81 +1215,162 @@ class VoiceHelper:
         except ImportError:
             from socketserver import ThreadingMixIn
             class ThreadingHTTPServerClass(ThreadingMixIn, HTTPServer):
-                pass
+                daemon_threads = True
+                allow_reuse_address = True
             HTTPServerClass = ThreadingHTTPServerClass
+        HTTPServerClass.daemon_threads = True
+        HTTPServerClass.allow_reuse_address = True
 
+        token = load_or_create_http_token(token_file)
         helper_self = self
+        allowed_commands = {
+            "stt": {"start_stt", "stop_stt", "check_env"},
+            "tts": {"tts", "stop_tts", "pause_tts", "resume_tts", "play_audio"},
+        }.get(mode, set())
 
         class CustomHandler(http.server.BaseHTTPRequestHandler):
+            def setup(self):
+                super().setup()
+                self.connection.settimeout(10)
+
             def log_message(self, format, *args):
+                # Voice data must not be written to the journal by the HTTP layer.
                 pass
 
+            def _origin_allowed(self):
+                origin = self.headers.get("Origin", "").strip()
+                if not origin or origin == "null":
+                    return True
+                from urllib.parse import urlsplit
+                try:
+                    parsed = urlsplit(origin)
+                    return (parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1")
+                            and not parsed.username and not parsed.password and not parsed.path
+                            and not parsed.query and not parsed.fragment
+                            and (parsed.port is None or 1 <= parsed.port <= 65535))
+                except ValueError:
+                    return False
+
+            def _host_allowed(self):
+                host = self.headers.get("Host", "").strip().lower()
+                if host.startswith("[") and "]" in host:
+                    host = host[1:host.index("]")]
+                else:
+                    host = host.split(":", 1)[0]
+                return host in ("127.0.0.1", "localhost", "::1")
+
+            def _authorized(self):
+                supplied = self.headers.get("X-KDE-AI-Chat-Token", "")
+                return bool(supplied) and hmac.compare_digest(supplied, token)
+
+            def _send_headers(self, content_type="application/json"):
+                self.send_header("Content-Type", content_type)
+                origin = self.headers.get("Origin", "")
+                if origin and self._origin_allowed():
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Vary", "Origin")
+
+            def _reject(self, status=403):
+                self.send_response(status)
+                self._send_headers()
+                self.end_headers()
+                try:
+                    self.wfile.write(json.dumps({"error": "Voice API request rejected"}).encode("utf-8"))
+                except OSError:
+                    pass
+
+            def _guard(self):
+                if not self._host_allowed() or not self._origin_allowed() or not self._authorized():
+                    self._reject(403)
+                    return False
+                return True
+
             def do_OPTIONS(self):
+                if not self._host_allowed() or not self._origin_allowed():
+                    self._reject(403)
+                    return
                 self.send_response(204)
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self._send_headers("")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-KDE-AI-Chat-Token")
                 self.end_headers()
 
             def do_GET(self):
-                if self.path == "/status":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    vram_kb = 0
-                    try:
-                        import torch
-                        if torch.cuda.is_available():
-                            vram_kb = torch.cuda.memory_reserved() // 1024
-                    except:
-                        pass
-
-                    status_data = {
-                        "status": helper_self.current_status,
-                        "chunk": getattr(helper_self, "current_chunk", ""),
-                        "countdown": helper_self.current_countdown,
-                        "recorded_audio_path": helper_self.temp_audio_path if os.path.exists(helper_self.temp_audio_path) else "",
-                        "stt_device": getattr(helper_self, "stt_device", "cpu"),
-                        "tts_device": getattr(helper_self, "tts_device", "cpu"),
-                        "vram_kb": vram_kb,
-                        "stt_result": getattr(helper_self, "stt_result", None),
-                        "tts_result": getattr(helper_self, "tts_result", None),
-                    }
-                    self.wfile.write(json.dumps(status_data).encode("utf-8"))
-                else:
+                if not self._guard():
+                    return
+                if self.path != "/status":
                     self.send_response(404)
                     self.end_headers()
+                    return
+
+                vram_kb = 0
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        vram_kb = torch.cuda.memory_reserved() // 1024
+                except Exception:
+                    pass
+
+                status_data = {
+                    "status": helper_self.current_status,
+                    "chunk": getattr(helper_self, "current_chunk", ""),
+                    "countdown": helper_self.current_countdown,
+                    "recorded_audio_path": helper_self.temp_audio_path if os.path.exists(helper_self.temp_audio_path) else "",
+                    "stt_device": getattr(helper_self, "stt_device", "cpu"),
+                    "tts_device": getattr(helper_self, "tts_device", "cpu"),
+                    "vram_kb": vram_kb,
+                    "stt_result": getattr(helper_self, "stt_result", None),
+                    "tts_result": getattr(helper_self, "tts_result", None),
+                }
+                body = json.dumps(status_data).encode("utf-8")
+                self.send_response(200)
+                self._send_headers()
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def do_POST(self):
-                if self.path in ("/command", "/"):
-                    content_length = int(self.headers['Content-Length'])
-                    post_data = self.rfile.read(content_length)
-                    try:
-                        payload = json.loads(post_data.decode('utf-8'))
-                    except Exception:
-                        self.send_response(400)
-                        self.send_header("Access-Control-Allow-Origin", "*")
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode("utf-8"))
-                        return
-
-                    res = helper_self.process_server_command(payload, mode)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.wfile.write(json.dumps(res).encode("utf-8"))
-                else:
+                if not self._guard():
+                    return
+                if self.path not in ("/command", "/"):
                     self.send_response(404)
                     self.end_headers()
+                    return
+                try:
+                    content_length = int(self.headers.get("Content-Length", "-1"))
+                except ValueError:
+                    content_length = -1
+                if content_length < 0 or content_length > MAX_HTTP_BODY:
+                    self._reject(413 if content_length > MAX_HTTP_BODY else 411)
+                    return
+                post_data = self.rfile.read(content_length)
+                try:
+                    payload = json.loads(post_data.decode("utf-8"))
+                except Exception:
+                    self._reject(400)
+                    return
+                if not isinstance(payload, dict) or payload.get("cmd") not in allowed_commands:
+                    self._reject(400)
+                    return
+
+                res = helper_self.process_server_command(payload, mode)
+                body = json.dumps(res).encode("utf-8")
+                self.send_response(200)
+                self._send_headers()
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
         server = HTTPServerClass(("127.0.0.1", port), CustomHandler)
-        print(f"Starting {mode} server on 127.0.0.1:{port}", flush=True)
+        self.http_server = server
+        print(f"Starting authenticated {mode} server on 127.0.0.1:{port}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            server.server_close()
+            self.http_server = None
 
     def process_command(self, line):
         """Process a single JSON command from stdin."""
@@ -1194,9 +1379,13 @@ class VoiceHelper:
         except json.JSONDecodeError as e:
             self.emit({"type": "error", "error": "Invalid JSON: " + str(e)})
             return
+        if not isinstance(cmd_data, dict):
+            self.emit({"type": "error", "error": "Voice command must be a JSON object"})
+            return
 
         cmd = cmd_data.get("cmd", "")
         handlers = {
+            "get_http_token": self.get_http_token,
             "check_env": self.check_env,
             "start_stt": self.start_stt,
             "stop_stt": self.stop_stt,
@@ -1248,12 +1437,13 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=None, help="HTTP server port")
     parser.add_argument("--command-json", default="", help="Run one JSON command and exit")
     parser.add_argument("--command-b64", default="", help="Run one base64-encoded JSON command and exit")
+    parser.add_argument("--token-file", default="", help="Private token file for the local HTTP server")
     args = parser.parse_args()
 
     helper = VoiceHelper()
     if args.command_b64:
         try:
-            command_json = base64.b64decode(args.command_b64.encode("ascii")).decode("utf-8")
+            command_json = base64.b64decode(args.command_b64.encode("ascii"), validate=True).decode("utf-8")
             helper.process_command(command_json)
             helper.wait_for_background_work()
         except Exception as e:
@@ -1338,9 +1528,9 @@ if __name__ == "__main__":
 
         import threading
         threading.Thread(target=preload_stt, daemon=True).start()
-        helper.run_http_server(port, mode="stt")
+        helper.run_http_server(port, mode="stt", token_file=args.token_file)
     elif args.tts_server:
         port = args.port or 9016
-        helper.run_http_server(port, mode="tts")
+        helper.run_http_server(port, mode="tts", token_file=args.token_file)
     else:
         helper.run()

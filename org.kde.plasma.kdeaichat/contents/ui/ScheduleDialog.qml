@@ -894,6 +894,7 @@ import org.kde.plasma.plasma5support as P5Support
 
                         Layout.fillWidth: true
                         Layout.preferredHeight: 80
+                        maximumLength: 100000
                         wrapMode: TextEdit.Wrap
                         text: scheduleDialog.draft.message || ""
                         placeholderText: translate("e.g. What should I focus on today?")

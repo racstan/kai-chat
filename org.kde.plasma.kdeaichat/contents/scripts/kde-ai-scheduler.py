@@ -17,9 +17,11 @@ import fcntl
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 parser = argparse.ArgumentParser(
@@ -45,6 +47,9 @@ LOCK_FD = None
 
 # Tick interval in seconds
 TICK_SECONDS = 5
+MAX_SCHEDULE_STORE_BYTES = 5 * 1024 * 1024
+MAX_SCHEDULES = 1000
+MAX_HISTORY_ENTRIES = 1000
 
 # ── Globals ────────────────────────────────────────────────────────────────────
 schedules = []
@@ -75,34 +80,96 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 
 # ── Filesystem helpers ─────────────────────────────────────────────────────────
 def ensure_dirs():
-    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
-    os.makedirs(os.path.join(DATA_DIR, "pending"), mode=0o700, exist_ok=True)
+    for directory in (DATA_DIR, os.path.join(DATA_DIR, "pending")):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try: os.chmod(directory, 0o700)
+        except OSError: pass
+
+
+@contextmanager
+def data_lock():
+    """Coordinate schedule-store writes with the plasmoid helper."""
+    path = SCHEDULES_FILE + ".lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _safe_int(value, default, minimum=None):
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = default
+    if minimum is not None:
+        result = max(minimum, result)
+    return result
+
+
+def _as_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return default
 
 
 def write_lock():
     global LOCK_FD
+    fd = None
     try:
-        LOCK_FD = os.open(LOCK_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        fcntl.lockf(LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.write(LOCK_FD, str(os.getpid()).encode())
+        fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(fd, 0o600)
+        # Acquire the inode lock before truncating or writing the PID. This
+        # prevents a second startup from clobbering an active daemon's lock.
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        LOCK_FD = fd
     except (OSError, IOError) as e:
+        if fd is not None:
+            try: os.close(fd)
+            except OSError: pass
         log.error("Lock file %s: %s — another instance may be running", LOCK_FILE, e)
         sys.exit(1)
+
+
+def _lock_pid_is_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def cleanup():
     global LOCK_FD
     if LOCK_FD is not None:
-        try:
-            os.close(LOCK_FD)
-        except OSError:
-            pass
+        # Unlink while the descriptor is still locked, then release it. A new
+        # daemon can create a fresh inode without an old cleanup removing it.
+        try: os.unlink(LOCK_FILE)
+        except OSError: pass
+        try: os.close(LOCK_FD)
+        except OSError: pass
         LOCK_FD = None
-    try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
-    except OSError:
-        pass
+    else:
+        # Also clean up an abandoned stale PID file, but never unlink a lock
+        # that appears to belong to a live daemon we do not own.
+        try:
+            with open(LOCK_FILE, encoding="ascii") as f:
+                pid = int(f.read().strip())
+            if not _lock_pid_is_alive(pid):
+                os.unlink(LOCK_FILE)
+        except (OSError, ValueError):
+            pass
 
 
 # ── Schedules I/O ──────────────────────────────────────────────────────────────
@@ -110,43 +177,33 @@ def load_schedules():
     global history, execute_missed_schedules, history_limit, settings_dict
     if not os.path.exists(SCHEDULES_FILE):
         log.debug(f"Schedules file not found: {SCHEDULES_FILE}")
-        history = []
-        execute_missed_schedules = False
-        history_limit = 100
-        settings_dict = {}
+        history, execute_missed_schedules, history_limit, settings_dict = [], False, 100, {}
         return []
     try:
-        with open(SCHEDULES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with data_lock():
+            if os.path.getsize(SCHEDULES_FILE) > MAX_SCHEDULE_STORE_BYTES:
+                raise ValueError("schedule store is too large")
+            with open(SCHEDULES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
         if isinstance(data, list):
-            items = data
-            history = []
-            execute_missed_schedules = False
-            history_limit = 100
-            settings_dict = {}
+            items, history, settings_dict = data, [], {}
         elif isinstance(data, dict):
             items = data.get("schedules", [])
             history = data.get("history", [])
             settings_dict = data.get("settings", {})
-            execute_missed_schedules = settings_dict.get("executeMissedSchedules", False)
-            try:
-                history_limit = int(settings_dict.get("historyLimit", 100))
-            except Exception:
-                history_limit = 100
+            if not isinstance(settings_dict, dict): settings_dict = {}
         else:
-            items = []
-            history = []
-            execute_missed_schedules = False
-            history_limit = 100
-            settings_dict = {}
+            items, history, settings_dict = [], [], {}
+        items = [s for s in items if isinstance(s, dict)][:MAX_SCHEDULES] if isinstance(items, list) else []
+        history = [h for h in history if isinstance(h, dict)] if isinstance(history, list) else []
+        execute_missed_schedules = _as_bool(settings_dict.get("executeMissedSchedules", False))
+        history_limit = min(MAX_HISTORY_ENTRIES, _safe_int(settings_dict.get("historyLimit", 100), 100, 1))
+        history = history[-history_limit:]
         log.info(f"Loaded {len(items)} schedule(s) (executeMissed={execute_missed_schedules}, historyLimit={history_limit}) and {len(history)} history entry(s) from {SCHEDULES_FILE}")
         return items
-    except (json.JSONDecodeError, OSError) as e:
+    except (json.JSONDecodeError, OSError, ValueError) as e:
         log.error("Failed to load schedules: %s", e)
-        history = []
-        execute_missed_schedules = False
-        history_limit = 100
-        settings_dict = {}
+        history, execute_missed_schedules, history_limit, settings_dict = [], False, 100, {}
         return []
 
 
@@ -155,38 +212,56 @@ def save_schedules(items, modified_sids=None):
     if modified_sids is None:
         modified_sids = set()
     try:
-        try:
-            with open(SCHEDULES_FILE, "r", encoding="utf-8") as f:
-                disk_data = json.load(f)
-        except Exception:
-            disk_data = {"version": 1, "schedules": [], "history": [], "settings": {}}
-
-        disk_schedules = disk_data.get("schedules", [])
-        
-        if not modified_sids:
-            disk_schedules = items
-        else:
-            disk_map = {s.get("id"): s for s in disk_schedules}
-            for s in items:
-                sid = s.get("id")
-                if sid in modified_sids:
-                    if sid in disk_map:
+        with data_lock():
+            try:
+                with open(SCHEDULES_FILE, "r", encoding="utf-8") as f:
+                    disk_data = json.load(f)
+            except Exception:
+                disk_data = {"version": 1, "schedules": [], "history": [], "settings": {}}
+            if not isinstance(disk_data, dict):
+                disk_data = {"version": 1, "schedules": [], "history": [], "settings": {}}
+            disk_schedules = disk_data.get("schedules", [])
+            if not isinstance(disk_schedules, list): disk_schedules = []
+            disk_schedules = [s for s in disk_schedules if isinstance(s, dict)]
+            if not modified_sids:
+                disk_schedules = [s for s in items if isinstance(s, dict)]
+            else:
+                disk_map = {s.get("id"): s for s in disk_schedules if s.get("id") is not None}
+                for s in items:
+                    if not isinstance(s, dict): continue
+                    sid = s.get("id")
+                    if sid in modified_sids and sid in disk_map:
                         disk_map[sid] = s
-            disk_schedules = list(disk_map.values())
-
-        payload = {
-            "version": 1,
-            "schedules": disk_schedules,
-            "history": history,
-            "settings": settings_dict
-        }
-        tmp = SCHEDULES_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, SCHEDULES_FILE)
-        os.chmod(SCHEDULES_FILE, 0o600)
+                disk_schedules = list(disk_map.values())
+            # Merge history/settings read from disk so helper/UI writes made
+            # while the daemon was running are not silently overwritten.
+            merged_history = []
+            seen_history = set()
+            for entry in list(disk_data.get("history", []) or []) + list(history or []):
+                if not isinstance(entry, dict): continue
+                key = entry.get("id") or json.dumps(entry, sort_keys=True, ensure_ascii=False)
+                if key not in seen_history:
+                    seen_history.add(key); merged_history.append(entry)
+            merged_history = merged_history[-max(1, history_limit):]
+            disk_settings = disk_data.get("settings", {})
+            if not isinstance(disk_settings, dict): disk_settings = {}
+            if not disk_settings and settings_dict:
+                disk_settings = dict(settings_dict)
+            payload = {"version": 1, "schedules": disk_schedules, "history": merged_history, "settings": disk_settings}
+            serialized = json.dumps(payload, indent=2, ensure_ascii=False)
+            if len(serialized.encode("utf-8")) > MAX_SCHEDULE_STORE_BYTES:
+                raise ValueError("schedule store would exceed the size limit")
+            tmp = SCHEDULES_FILE + f".tmp-{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(serialized)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, SCHEDULES_FILE)
+            os.chmod(SCHEDULES_FILE, 0o600)
+            history = merged_history
+            settings_dict = disk_settings
         log.debug("Schedules and history saved")
-    except OSError as e:
+    except (OSError, ValueError) as e:
         log.error("Failed to save schedules: %s", e)
 
 
@@ -198,6 +273,8 @@ WEEKDAY_NAMES = {
 
 
 def parse_cron_field(field_str, min_val, max_val):
+    if not isinstance(field_str, str) or not field_str.strip():
+        raise ValueError("invalid cron field")
     field_str = field_str.strip().lower()
     for name, num in WEEKDAY_NAMES.items():
         field_str = field_str.replace(name, str(num))
@@ -210,6 +287,8 @@ def parse_cron_field(field_str, min_val, max_val):
         if "/" in part:
             part, step_str = part.split("/", 1)
             step = int(step_str)
+            if step <= 0:
+                raise ValueError("cron step must be positive")
 
         if part == "*":
             start, end = min_val, max_val
@@ -218,9 +297,13 @@ def parse_cron_field(field_str, min_val, max_val):
             start, end = int(start_str), int(end_str)
         else:
             val = int(part)
+            if val < min_val or val > max_val:
+                raise ValueError("cron value out of range")
             result.add(val)
             continue
 
+        if start < min_val or end > max_val or start > end:
+            raise ValueError("cron range out of range")
         for v in range(start, end + 1, step):
             result.add(v)
 
@@ -228,6 +311,8 @@ def parse_cron_field(field_str, min_val, max_val):
 
 
 def cron_matches(cron_expr, dt):
+    if not isinstance(cron_expr, str):
+        return False
     parts = cron_expr.strip().split()
     if len(parts) != 5:
         return False
@@ -237,7 +322,7 @@ def cron_matches(cron_expr, dt):
         mdays = parse_cron_field(parts[2], 1, 31)
         months = parse_cron_field(parts[3], 1, 12)
         wdays = parse_cron_field(parts[4], 0, 6)
-    except (ValueError, IndexError):
+    except (TypeError, ValueError, IndexError):
         return False
 
     py_wd = dt.weekday()
@@ -265,11 +350,23 @@ def cron_matches(cron_expr, dt):
 
 # ── Schedule runner ────────────────────────────────────────────────────────────
 def run_schedule(s):
-    sid = s.get("id", "unknown")
-    name = s.get("name", "Unnamed")
-    chat_id = s.get("chatId", "")
-    message = s.get("message", "").strip()
-    should_notify = s.get("notify", True)
+    if not isinstance(s, dict):
+        log.warning("Skipping malformed schedule entry")
+        return "error"
+    sid = str(s.get("id", "unknown"))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid):
+        log.warning("[%s] Skipping — invalid schedule id", sid[:64])
+        return "error"
+    name = str(s.get("name", "Unnamed"))[:256]
+    chat_id = str(s.get("chatId", ""))
+    if chat_id and not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", chat_id):
+        log.warning("[%s] Skipping — invalid chat id", name)
+        return "error"
+    message = str(s.get("message", "")).strip()
+    if len(message) > 200000:
+        log.warning("[%s] Skipping — message is too large", name)
+        return "error"
+    should_notify = _as_bool(s.get("notify", True), True)
 
     if not chat_id or not message:
         log.warning("[%s] Skipping — missing chatId or message", name)
@@ -295,24 +392,37 @@ def run_schedule(s):
         log.info("[%s] DRY-RUN: would write trigger to %s", name, path)
         return "success"  # pretend it worked
 
+    temporary = ""
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        temporary = path + f".tmp-{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as f:
+            os.chmod(temporary, 0o600)
             json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
         os.chmod(path, 0o600)
         log.info(f"[{name}] Wrote pending trigger file successfully: {path}")
         return "success"
     except Exception as e:
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
         log.error("[%s] Failed to write pending trigger: %s", name, e)
         return "error"
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 def is_start_date_passed(s, now):
+    if not isinstance(s, dict):
+        return False
     start_date_str = s.get("startDate")
     if not start_date_str:
         return True
     try:
-        clean_str = start_date_str
+        clean_str = str(start_date_str)
         if clean_str.endswith("Z"):
             clean_str = clean_str[:-1] + "+00:00"
         
@@ -334,6 +444,8 @@ def is_start_date_passed(s, now):
 def update_schedule_timestamps(items, sid, now_iso, status, next_iso):
     updated = []
     for s in items:
+        if not isinstance(s, dict):
+            continue
         if s.get("id") == sid:
             s = dict(s)
             s["lastRunAt"] = now_iso
@@ -346,6 +458,8 @@ def update_schedule_timestamps(items, sid, now_iso, status, next_iso):
 
 def next_run_iso(cron_expr, start_date_str=None):
     """Compute next cron fire time. Pre-parses fields once to avoid per-iteration overhead."""
+    if not isinstance(cron_expr, str):
+        return ""
     parts = cron_expr.strip().split()
     if len(parts) != 5:
         return ""
@@ -365,7 +479,7 @@ def next_run_iso(cron_expr, start_date_str=None):
     start_dt = None
     if start_date_str:
         try:
-            clean_str = start_date_str
+            clean_str = str(start_date_str)
             if clean_str.endswith("Z"):
                 clean_str = clean_str[:-1] + "+00:00"
             parsed_dt = datetime.fromisoformat(clean_str)
@@ -412,8 +526,10 @@ def refresh_next_runs(items):
     modified_sids = set()
     now = datetime.now()
     for s in items:
-        if s.get("enabled") and not s.get("archived", False):
-            cron = s.get("cron", "")
+        if not isinstance(s, dict):
+            continue
+        if _as_bool(s.get("enabled"), False) and not _as_bool(s.get("archived", False), False):
+            cron = str(s.get("cron", "") or "").strip()
             if cron:
                 next_run_str = s.get("nextRunAt", "")
                 should_recalc = False
@@ -422,7 +538,7 @@ def refresh_next_runs(items):
                     should_recalc = True
                 else:
                     try:
-                        clean_next = next_run_str
+                        clean_next = str(next_run_str)
                         if clean_next.endswith("Z"):
                             clean_next = clean_next[:-1]
                         if "." in clean_next:
@@ -506,17 +622,19 @@ def main():
         modified_sids = set()
 
         for s in schedules:
-            if s.get("archived", False):
+            if not isinstance(s, dict) or _as_bool(s.get("archived", False), False):
                 continue
             
-            sid = s.get("id", "")
+            sid = str(s.get("id", ""))
+            if not sid:
+                continue
             
             # Migration for old tasks that were finished but not archived correctly by previous versions
-            if not s.get("enabled", True):
+            if not _as_bool(s.get("enabled", True), True):
                 disable_task = False
                 if s.get("taskType") == "single":
                     disable_task = True
-                elif s.get("limitEnabled", False) and int(s.get("runCount", 0)) >= int(s.get("limitCount", 5)):
+                elif _as_bool(s.get("limitEnabled", False)) and _safe_int(s.get("runCount", 0), 0, 0) >= _safe_int(s.get("limitCount", 5), 5, 1):
                     disable_task = True
                 
                 if disable_task:
@@ -525,9 +643,9 @@ def main():
                     modified_sids.add(sid)
                 continue
 
-            cron = s.get("cron", "").strip()
-            trigger_now = s.get("triggerNow", False)
-            task_type = s.get("taskType", "repeat")
+            cron = str(s.get("cron", "") or "").strip()
+            trigger_now = _as_bool(s.get("triggerNow", False))
+            task_type = str(s.get("taskType", "repeat") or "repeat")
 
             # Start date filter
             start_passed = is_start_date_passed(s, now)
@@ -535,9 +653,9 @@ def main():
                 continue
 
             # Limit checking
-            if task_type == "repeat" and s.get("limitEnabled", False):
-                run_count = int(s.get("runCount", 0))
-                limit_count = int(s.get("limitCount", 5))
+            if task_type == "repeat" and _as_bool(s.get("limitEnabled", False)):
+                run_count = _safe_int(s.get("runCount", 0), 0, 0)
+                limit_count = _safe_int(s.get("limitCount", 5), 5, 1)
                 if run_count >= limit_count:
                     s["enabled"] = False
                     modified_sids.add(sid)
@@ -549,7 +667,7 @@ def main():
                     should_run = not s.get("lastRunAt")
                 elif cron:
                     # Prevent multiple runs within the same minute
-                    last_run = s.get("lastRunAt", "")
+                    last_run = str(s.get("lastRunAt", "") or "")
                     if last_run and last_run.startswith(now_iso[:16]):
                         should_run = False
                     else:
@@ -577,13 +695,13 @@ def main():
                     log.error("Failed to append to history: %s", ex)
 
                 # Update run counts and limits
-                new_count = int(s.get("runCount", 0)) + 1
+                new_count = _safe_int(s.get("runCount", 0), 0, 0) + 1
                 s["runCount"] = new_count
 
                 disable_task = False
                 if task_type == "single":
                     disable_task = True
-                elif s.get("limitEnabled", False) and new_count >= int(s.get("limitCount", 5)):
+                elif _as_bool(s.get("limitEnabled", False)) and new_count >= _safe_int(s.get("limitCount", 5), 5, 1):
                     disable_task = True
 
                 next_iso = ""

@@ -1149,7 +1149,7 @@ let payload = {
 "configPath": page.configFilePath
 };
 let b64Payload = base64Encode(JSON.stringify(payload));
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " load_config_keys " + Sec.quoteForShell(b64Payload);
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " load_config_keys " + Sec.rawShellSnippetQuote(b64Payload);
 page.utilityDs.connectSource(cmd + " #plainconfig-load");
 }
 
@@ -1209,7 +1209,7 @@ let payload = {
 };
 let b64Payload = base64Encode(JSON.stringify(payload));
 let safeConfigPath = Sec.validateFilePath(page.configFilePath);
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " sync_config_keys " + Sec.quoteForShell(b64Payload);
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " sync_config_keys " + Sec.rawShellSnippetQuote(b64Payload);
 if (safeConfigPath !== "")
 cmd += " && xdg-open " + Sec.quoteForShell(safeConfigPath);
 page.utilityDs.connectSource(cmd + " #open-config");
@@ -1246,7 +1246,7 @@ let payload = {
 "keys": keysPayload
 };
 let b64Payload = base64Encode(JSON.stringify(payload));
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " sync_config_keys " + Sec.quoteForShell(b64Payload);
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " sync_config_keys " + Sec.rawShellSnippetQuote(b64Payload);
 page.utilityDs.connectSource(cmd + " #plainconfig-sync");
 }
 
@@ -1257,7 +1257,7 @@ let payload = {
 "keys": ['apiKey', 'anthropicApiKey', 'groqApiKey', 'deepSeekApiKey', 'miniMaxApiKey', 'fireworksApiKey', 'googleApiKey', 'openRouterApiKey', 'mistralApiKey', 'cloudflareApiKey', 'nvidiaApiKey', 'huggingFaceApiKey', 'xaiApiKey', 'litellmApiKey', 'qwenApiKey', 'moonshotApiKey', 'mimoApiKey', 'maritacaApiKey', 'huggingfaceImageApiKey', 'togetherImageApiKey', 'stabilityApiKey', 'replicateApiKey']
 };
 let b64Payload = base64Encode(JSON.stringify(payload));
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " clear_config_keys " + Sec.quoteForShell(b64Payload);
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " clear_config_keys " + Sec.rawShellSnippetQuote(b64Payload);
 page.utilityDs.connectSource(cmd + " #plainconfig-clear");
 plasmoid.configuration.apiKey = "";
 plasmoid.configuration.anthropicApiKey = "";
@@ -1493,8 +1493,8 @@ if (payloadStr === page._lastSchedSetupPayload)
 return;
 page._lastSchedSetupPayload = payloadStr;
 let b64Payload = base64Encode(payloadStr);
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " setup_scheduler_service " + Sec.quoteForShell(b64Payload);
-page.utilityDs.connectSource("sh -c " + Sec.quoteForShell(cmd) + " #sched-auto-setup");
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " setup_scheduler_service " + Sec.rawShellSnippetQuote(b64Payload);
+page.utilityDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #sched-auto-setup");
 }
 
 
@@ -1554,8 +1554,8 @@ let payload = {
 }
 };
 let b64Payload = base64Encode(JSON.stringify(payload));
-let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " save_all_schedules " + Sec.quoteForShell(b64Payload);
-page.utilityDs.connectSource("sh -c " + Sec.quoteForShell(cmd) + " #sched-save");
+let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " save_all_schedules " + Sec.rawShellSnippetQuote(b64Payload);
+page.utilityDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #sched-save");
 }
 
 

@@ -184,13 +184,37 @@ KCM.SimpleKCM {
     function getHelperPath() {
         let base = String(Qt.resolvedUrl("./voice/voice_helper.py"));
         if (base.indexOf("file://") === 0) base = base.substring(7);
-        return base;
+        return base.endsWith("/contents/ui/voice/voice_helper.py") ? base : "";
     }
 
     function getSetupPath() {
         let base = String(Qt.resolvedUrl("./voice/venv_setup.sh"));
         if (base.indexOf("file://") === 0) base = base.substring(7);
-        return base;
+        return base.endsWith("/contents/ui/voice/venv_setup.sh") ? base : "";
+    }
+
+    function getSystemHelperPath() {
+        let base = String(Qt.resolvedUrl("./kde_ai_helper.py"));
+        if (base.indexOf("file://") === 0) base = base.substring(7);
+        return base.endsWith("/contents/ui/kde_ai_helper.py") ? base : "";
+    }
+
+    function installVoiceServices() {
+        let helperPath = getSystemHelperPath();
+        if (!helperPath)
+            return;
+        let servicePayload = JSON.stringify({
+            "venvPy": getVenvPython(),
+            "espeakPath": hasPlasmoidConfig ? (plasmoid.configuration.voiceEspeakPath || "") : "",
+            "voiceEnabled": !!voiceEnabledToggle.checked,
+            "voiceTtsEnabled": !!voiceTtsEnabledToggle.checked
+        });
+        let encoded = Sec.base64Encode(servicePayload);
+        let venvPy = getVenvPython();
+        let safeVenvPy = venvPy.startsWith("~/") ? '"$HOME"' + Sec.quoteForShell(venvPy.substring(1)) : Sec.quoteForShell(venvPy);
+        let command = "if [ -f " + safeVenvPy + " ]; then python3 "
+            + Sec.quoteForShell(helperPath) + " setup_venv_services " + Sec.rawShellSnippetQuote(encoded) + "; fi";
+        voicePageDs.connectSource("timeout 30s sh -c " + Sec.rawShellSnippetQuote(command) + " #voice-services-" + Date.now());
     }
 
     function sendVoiceCommand(payload, tag) {
@@ -198,7 +222,9 @@ KCM.SimpleKCM {
         let venvPy = getVenvPython();
         let safeVenvPy = venvPy.startsWith("~/") ? '"$HOME"' + Sec.quoteForShell(venvPy.substring(1)) : Sec.quoteForShell(venvPy);
         let timeoutSeconds = tag === "check" ? 25 : (tag === "stt-test" ? 75 : 90);
-        let cmd = "if [ -f " + safeVenvPy + " ]; then " + safeVenvPy + " " + Sec.quoteForShell(helperPath) + " --command-json " + Sec.quoteForShell(payload) + "; else python3 " + Sec.quoteForShell(helperPath) + " --command-json " + Sec.quoteForShell(payload) + "; fi";
+        let encodedPayload = Sec.base64Encode(payload || "");
+        let encodedArg = Sec.rawShellSnippetQuote(encodedPayload);
+        let cmd = "if [ -f " + safeVenvPy + " ]; then " + safeVenvPy + " " + Sec.quoteForShell(helperPath) + " --command-b64 " + encodedArg + "; else python3 " + Sec.quoteForShell(helperPath) + " --command-b64 " + encodedArg + "; fi";
         let source = "timeout " + timeoutSeconds + "s sh -c " + Sec.rawShellSnippetQuote(cmd) + " #voice-" + (tag || "cmd") + "-" + Date.now();
         voicePageDs.connectSource(source);
         return source;
@@ -225,8 +251,23 @@ KCM.SimpleKCM {
         voiceSetupProgress = 0;
         voiceSetupStatus = i18n("Preparing voice engine. This installs code support only; it does not download models.");
         let mode = voiceGpuToggle.checked ? "gpu" : "cpu";
-        let cmd = "NON_INTERACTIVE=1 bash " + Sec.quoteForShell(getSetupPath()) + " " + Sec.quoteForShell(getVenvPath()) + " " + Sec.quoteForShell(mode);
-        voicePageDs.connectSource("sh -c " + Sec.quoteForShell(cmd) + " #voice-setup-" + Date.now());
+        let setupPath = getSetupPath();
+        let helperPath = getSystemHelperPath();
+        if (!setupPath || !helperPath) {
+            voiceSetupRunning = false;
+            voiceSetupStatus = i18n("Voice setup files are unavailable.");
+            return;
+        }
+        let servicePayload = JSON.stringify({
+            "venvPy": getVenvPython(),
+            "espeakPath": hasPlasmoidConfig ? (plasmoid.configuration.voiceEspeakPath || "") : "",
+            "voiceEnabled": !!voiceEnabledToggle.checked,
+            "voiceTtsEnabled": !!voiceTtsEnabledToggle.checked
+        });
+        let encodedServicePayload = Sec.base64Encode(servicePayload);
+        let cmd = "NON_INTERACTIVE=1 bash " + Sec.quoteForShell(setupPath) + " " + Sec.quoteForShell(getVenvPath()) + " " + Sec.quoteForShell(mode)
+            + " && python3 " + Sec.quoteForShell(helperPath) + " setup_venv_services " + Sec.rawShellSnippetQuote(encodedServicePayload);
+        voicePageDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #voice-setup-" + Date.now());
     }
 
     function sttReady() {
@@ -254,6 +295,10 @@ KCM.SimpleKCM {
             voicePageDs.disconnectSource(activeSttSource);
             activeSttSource = "";
         }
+        // The test may be running in a separate one-shot helper process. The
+        // stop marker makes cancellation effective even after its UI source is
+        // disconnected.
+        sendVoiceCommand(JSON.stringify({cmd: "stop_stt"}), "stt-cancel");
         sttTesting = false;
         sttTestResult = i18n("Recording stopped.");
     }
@@ -263,6 +308,7 @@ KCM.SimpleKCM {
             voicePageDs.disconnectSource(activeTtsSource);
             activeTtsSource = "";
         }
+        sendVoiceCommand(JSON.stringify({cmd: "stop_tts"}), "tts-cancel");
         ttsPlaying = false;
         ttsTestResult = i18n("Speech stopped.");
     }
@@ -431,12 +477,11 @@ KCM.SimpleKCM {
             onToggled: {
                 if (hasPlasmoidConfig) plasmoid.configuration.voiceEnabled = checked;
                 if (checked) {
-                    let startCmd = "systemctl --user enable --now kde-ai-stt.service 2>/dev/null; " + (voiceTtsEnabledToggle.checked ? "systemctl --user enable --now kde-ai-tts.service 2>/dev/null;" : "");
-                    voicePageDs.connectSource("sh -c " + Sec.quoteForShell(startCmd) + " #start-voice-" + Date.now());
+                    installVoiceServices();
                     runEnvCheck();
                 } else {
                     let killCmd = "systemctl --user disable --now kde-ai-stt.service 2>/dev/null; systemctl --user disable --now kde-ai-tts.service 2>/dev/null; pkill -f 'voice_helper.py --stt-server' 2>/dev/null; pkill -f 'voice_helper.py --tts-server' 2>/dev/null";
-                    voicePageDs.connectSource("sh -c " + Sec.quoteForShell(killCmd) + " #kill-voice-" + Date.now());
+                    voicePageDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(killCmd) + " #kill-voice-" + Date.now());
                 }
             }
         }
@@ -565,11 +610,10 @@ KCM.SimpleKCM {
             onCheckedChanged: {
                 if (hasPlasmoidConfig) plasmoid.configuration.voiceTtsEnabled = checked;
                 if (checked && voiceEnabledToggle.checked) {
-                    let startCmd = "systemctl --user enable --now kde-ai-tts.service 2>/dev/null";
-                    voicePageDs.connectSource("sh -c " + Sec.quoteForShell(startCmd) + " #start-tts-" + Date.now());
+                    installVoiceServices();
                 } else if (!checked) {
                     let killCmd = "systemctl --user disable --now kde-ai-tts.service 2>/dev/null; pkill -f 'voice_helper.py --tts-server' 2>/dev/null";
-                    voicePageDs.connectSource("sh -c " + Sec.quoteForShell(killCmd) + " #kill-tts-" + Date.now());
+                    voicePageDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(killCmd) + " #kill-tts-" + Date.now());
                 }
                 if (voiceEnabledToggle.checked) runEnvCheck();
             }

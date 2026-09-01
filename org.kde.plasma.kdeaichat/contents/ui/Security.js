@@ -19,7 +19,7 @@
 
 let _ALLOWED_URL_SCHEMES = ["http:", "https:", "mailto:"];
 let _SAFE_PATH_CHARS = /^[A-Za-z0-9._\/+@:=\-]+$/;
-let _SAFE_SESSION_ID = /^[A-Za-z0-9\-]{1,128}$/;
+let _SAFE_SESSION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 let _MAX_SHELL_ARG_LEN = 4096;
 
 /**
@@ -72,35 +72,19 @@ function validateUrl(url) {
     let s = String(url).trim();
     if (s === "")
         return "";
-    // Cheap pre-screen — anything that looks like `scheme:` must match
-    // the allowlist exactly. Lowercase comparison is safe because URL
-    // schemes are case-insensitive.
+    if (/[\u0000-\u001f\u007f]/.test(s))
+        return "";
     let lower = s.toLowerCase();
-    let ok = false;
-    for (let i = 0; i < _ALLOWED_URL_SCHEMES.length; i++) {
-        let scheme = _ALLOWED_URL_SCHEMES[i];
-        if (lower.indexOf(scheme) === 0) {
-            // Make sure the scheme is the *prefix* of a real authority,
-            // not a substring (e.g. `xhttps:` must not match `https:`).
-            // For http(s):// and mailto:, the next char must be `/` for
-            // web URLs, and any non-control character for mailto
-            // (e.g. `mailto:user@example.com`).
-            let after = s.substring(scheme.length);
-            if (after.length === 0)
-                continue;
-            let first = after.charAt(0);
-            if (scheme === "mailto:") {
-                // mailto takes an email address, no path delimiter required
-                if (first !== " " && first !== "\t" && first !== "\n" && first !== "\r")
-                    ok = true;
-            } else {
-                if (first === "/" || first === "?" || first === "#")
-                    ok = true;
-            }
-            break;
-        }
+    if (lower.indexOf("mailto:") === 0) {
+        let address = s.substring("mailto:".length).trim();
+        return address && !/[\s<>"'`]/.test(address) ? s : "";
     }
-    if (!ok)
+    // HTTP(S) links need an actual authority. The old prefix check accepted
+    // values such as `https:?x`, which are not external web URLs.
+    if (lower.indexOf("http://") !== 0 && lower.indexOf("https://") !== 0)
+        return "";
+    let authority = s.substring(s.indexOf("://") + 3).split(/[\/?#]/, 1)[0];
+    if (!authority || /[\s<>"'`]/.test(authority) || authority.indexOf("@") >= 0)
         return "";
     return s;
 }
@@ -115,6 +99,13 @@ function validateUrl(url) {
  * @param {string} url  Raw URL.
  * @returns {string}    Sanitized URL safe for `href="…"`, or `""`.
  */
+function validateHttpUrl(url) {
+    let validated = validateUrl(url);
+    if (validated === "" || !/^(?:http|https):\/\//i.test(validated))
+        return "";
+    return validated;
+}
+
 function safeHref(url) {
     let validated = validateUrl(url);
     if (validated === "")
@@ -141,23 +132,29 @@ function validateFilePath(p) {
     if (p === null || p === undefined)
         return "";
     let s = String(p);
-    if (s === "")
+    if (s === "" || s.length > _MAX_SHELL_ARG_LEN || s.charAt(0) === "~")
         return "";
-    // Reject path traversal outright — `..` segments are never needed
-    // for legitimate file references.
-    if (s.indexOf("..") !== -1)
+    if (/[\u0000\n\r]/.test(s))
         return "";
-    if (!_SAFE_PATH_CHARS.test(s))
+    // Spaces, Unicode, quotes and ordinary filename punctuation are valid
+    // path data. Shell metacharacters remain rejected at this boundary even
+    // though callers also quote the argument.
+    if (/[\$()\\`;&|<>]/.test(s))
         return "";
+    let segments = s.split("/");
+    for (let i = 0; i < segments.length; i++) {
+        if (segments[i] === "..")
+            return "";
+    }
     return s;
 }
 
 /**
- * Validate a session id (e.g. OpenCode remote session) before using
- * it as a URL path component.
+ * Validate a local session id before using it as an identifier in persisted
+ * chat state. Use validateRemoteSessionId() for server-issued URL ids.
  *
- * Allows the same characters that the OpenCode server itself emits
- * (alphanumerics and dashes) up to a reasonable length. Returns `""`
+ * Allows common local/server identifier punctuation up to a reasonable
+ * length. Returns `""`
  * for anything else so the caller can fail fast.
  *
  * @param {string} id  Raw session id.
@@ -168,6 +165,23 @@ function validateSessionId(id) {
         return "";
     let s = String(id);
     if (!_SAFE_SESSION_ID.test(s))
+        return "";
+    return s;
+}
+
+/**
+ * Validate a server-issued OpenCode session id. OpenCode ids are normally
+ * `ses_…`, but older/newer servers may include dots, colons, or other
+ * non-path punctuation. Reject only control characters and path separators;
+ * callers must still URI-encode this value before placing it in a URL path.
+ */
+function validateRemoteSessionId(id) {
+    if (id === null || id === undefined)
+        return "";
+    let s = String(id);
+    if (s.length < 1 || s.length > 256 || s === "." || s === "..")
+        return "";
+    if (/[\u0000-\u001f\u007f\/#?\s]/.test(s))
         return "";
     return s;
 }

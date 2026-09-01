@@ -116,9 +116,9 @@ KCM.SimpleKCM {
         if (urlStr.indexOf("file://") === 0)
             urlStr = urlStr.substring(7);
         let path = decodeURIComponent(urlStr);
-        if (path.indexOf("/") === 0 && path.indexOf("/contents/ui/") !== -1)
+        if (path.endsWith("/contents/ui/kde_ai_helper.py"))
             return path;
-        return _rawDataDir + "/plasma/plasmoids/org.kde.plasma.kdeaichat/contents/ui/kde_ai_helper.py";
+        return "";
     }
 
     function discoverMcpTools() {
@@ -131,13 +131,21 @@ KCM.SimpleKCM {
             mcpDiscoveryStatus = i18n("Add at least one MCP server first.");
             return;
         }
+        if (!getHelperPath()) {
+            mcpDiscoveryStatus = i18n("MCP helper is unavailable.");
+            return;
+        }
         mcpDiscoveryStatus = i18n("Discovering MCP tools…");
         var payload = Sec.base64Encode(JSON.stringify({"servers": servers}));
-        var cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " mcp_discover " + Sec.quoteForShell(payload);
+        var cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " mcp_discover " + Sec.rawShellSnippetQuote(payload);
         utilityDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #mcp-discover-" + Date.now());
     }
 
     function schedAutoSetup() {
+        if (!getHelperPath()) {
+            schedulerStatus = i18n("Scheduler helper is unavailable.");
+            return;
+        }
         let srcPath = String(Qt.resolvedUrl("../scripts/kde-ai-scheduler.py"));
         if (srcPath.indexOf("file://") === 0)
             srcPath = srcPath.substring(7);
@@ -184,6 +192,11 @@ KCM.SimpleKCM {
 
     function schedSaveAll() {
         schedSaving = true;
+        if (!getHelperPath()) {
+            schedSaving = false;
+            schedulerStatus = i18n("Scheduler helper is unavailable.");
+            return;
+        }
         let all = [];
         for (let i = 0; i < schedulerList.length; i++) {
             let s = Object.assign({}, schedulerList[i]);
@@ -210,7 +223,18 @@ KCM.SimpleKCM {
                 "historyLimit": limit
             }
         };
-        let b64Payload = Sec.base64Encode(JSON.stringify(payload));
+        let payloadJson = JSON.stringify(payload);
+        if (payloadJson.length > 650000) {
+            schedSaving = false;
+            schedulerStatus = i18n("Schedules are too large to save in one operation. Remove old history or shorten schedule messages.");
+            return;
+        }
+        let b64Payload = Sec.base64Encode(payloadJson);
+        if (b64Payload.length > 900000) {
+            schedSaving = false;
+            schedulerStatus = i18n("Schedules are too large to save in one operation. Remove old history or shorten schedule messages.");
+            return;
+        }
         let cmd = "python3 " + Sec.quoteForShell(getHelperPath()) + " save_all_schedules " + Sec.rawShellSnippetQuote(b64Payload);
         utilityDs.connectSource("sh -c " + Sec.rawShellSnippetQuote(cmd) + " #sched-save-" + Date.now());
     }
@@ -374,6 +398,10 @@ KCM.SimpleKCM {
             let err = data["stderr"] ? data["stderr"] : "";
 
             if (out.trim() === "" && err.trim() === "") {
+                if (sourceName.indexOf("sched-save") >= 0) {
+                    configPage.schedSaving = false;
+                    configPage.schedulerStatus = i18n("Could not save schedules: helper returned no output.");
+                }
                 disconnectSource(sourceName);
                 return;
             }
@@ -434,10 +462,9 @@ KCM.SimpleKCM {
                 else if (out.indexOf("AUTO_DISABLED") >= 0)
                     schedAutoStartToggle.checked = false;
             } else if (sourceName.indexOf("sched-load") >= 0) {
-                console.log("ConfigOther sched-load: sourceName =", sourceName, "stdout length =", out.length, "stderr =", err);
+                console.log("ConfigOther sched-load response lengths:", out.length, err.length);
                 if (out !== "") {
                     try {
-                        console.log("ConfigOther sched-load raw stdout:", out);
                         let parsed = JSON.parse(out);
                         let allSchedules = parsed.schedules || [];
                         console.log("ConfigOther sched-load parsed schedules count:", allSchedules.length);
@@ -466,8 +493,11 @@ KCM.SimpleKCM {
                 }
             } else if (sourceName.indexOf("sched-save") >= 0) {
                 configPage.schedSaving = false;
-                configPage.schedulerStatus = "Schedules saved.";
-                configPage.schedLoadSchedules();
+                configPage.schedulerStatus = out.indexOf("SCHED_SAVE_OK") >= 0
+                    ? i18n("Schedules saved.")
+                    : i18n("Could not save schedules: %1").arg(err || out || i18n("helper failed"));
+                if (out.indexOf("SCHED_SAVE_OK") >= 0)
+                    configPage.schedLoadSchedules();
             }
 
             disconnectSource(sourceName);
@@ -886,6 +916,7 @@ KCM.SimpleKCM {
             Layout.fillWidth: true
             Layout.maximumWidth: formLayout.fieldMaxWidth
             Layout.preferredHeight: 76
+            maximumLength: 200000
             wrapMode: Text.Wrap
             placeholderText: '[{"id":"filesystem","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"],"tools":[]}]'
             text: (plasmoid && plasmoid.configuration) ? (plasmoid.configuration.mcpServersJson || "[]") : "[]"
@@ -916,7 +947,7 @@ KCM.SimpleKCM {
             Layout.fillWidth: true
             Layout.maximumWidth: formLayout.fieldMaxWidth
             wrapMode: Text.Wrap
-            text: i18n("Use command + args for an MCP stdio server, then click Discover tools. The standard MCP initialize/tools-list handshake fills the tools automatically.")
+            text: i18n("Use command + args for an MCP stdio server, then click Discover tools. The standard MCP initialize/tools-list handshake fills the tools automatically. Only configure trusted servers: MCP processes run with your user permissions.")
             opacity: 0.7
             font.pointSize: Kirigami.Theme.smallFont.pointSize
         }

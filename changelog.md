@@ -5,6 +5,14 @@ All notable changes to the **KDE AI Chat** project will be documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Hardened voice daemons with per-user token authentication, loopback/origin checks, bounded requests, private temporary audio, and authenticated systemd setup.
+- Reworked live request/session cancellation, OpenCode/Pi completion handling, MCP follow-up generations, context compaction, attachment correlation, and queued scheduler triggers.
+- Added URL/path/session validation, bounded message and scheduler payloads, atomic scheduler writes, KWallet synchronization for custom providers, and temporary attachment cleanup.
+- Added live QML linting, package-manifest verification, and a translation smoke-test compatibility module to CI.
+
 ## [1.3.1] - 2026-07-22
 
 ### Fixed

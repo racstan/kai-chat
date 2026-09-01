@@ -7,6 +7,7 @@ import org.kde.plasma.components as PC3
 import org.kde.plasma.plasma5support 2.0 as P5Support
 import org.kde.plasma.plasmoid
 import "ProviderService.js" as ProviderService
+import "Security.js" as Sec
 
 Item {
     id: repRoot
@@ -296,6 +297,33 @@ Item {
                 onClicked: root.createSession(true)
             }
 
+        }
+
+        Rectangle {
+            visible: root.sessionHistoryLoadError !== ""
+            Layout.fillWidth: true
+            color: Qt.rgba(Kirigami.Theme.negativeTextColor.r, Kirigami.Theme.negativeTextColor.g, Kirigami.Theme.negativeTextColor.b, 0.10)
+            border.color: Kirigami.Theme.negativeTextColor
+            border.width: 1
+            radius: 6
+            implicitHeight: historyWarningRow.implicitHeight + Kirigami.Units.smallSpacing * 2
+
+            RowLayout {
+                id: historyWarningRow
+                anchors.fill: parent
+                anchors.margins: Kirigami.Units.smallSpacing
+                QQC2.Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: root.sessionHistoryLoadError
+                    color: Kirigami.Theme.negativeTextColor
+                }
+                PC3.Button {
+                    text: "Replace stored history"
+                    icon.name: "edit-clear-all"
+                    onClicked: root.resetUnreadableSessionHistory()
+                }
+            }
         }
 
         RowLayout {
@@ -673,6 +701,7 @@ Item {
 
                                                     sourceComponent: QQC2.TextArea {
                                                         width: parent ? parent.width : implicitWidth
+                                                        maximumLength: 200000
                                                         text: root.editingDraft
                                                         wrapMode: Text.WordWrap
                                                         onTextChanged: root.editingDraft = text
@@ -706,7 +735,9 @@ Item {
                                                             property int savedSelectionEnd: -1
 
                                                             onLinkActivated: function(link) {
-                                                                Qt.openUrlExternally(link);
+                                                                var safeLink = Sec.validateUrl(link);
+                                                                if (safeLink)
+                                                                    Qt.openUrlExternally(safeLink);
                                                             }
 
                                                             onSelectedTextChanged: {
@@ -937,7 +968,7 @@ Item {
                                                                     Image {
                                                                         anchors.fill: parent
                                                                         visible: modelData.type === "image"
-                                                                        source: "file://" + modelData.path
+                                                                        source: modelData.content ? ("data:" + (modelData.mimeType || "image/png") + ";base64," + modelData.content) : ("file://" + modelData.path)
                                                                         fillMode: Image.PreserveAspectCrop
                                                                         clip: true
                                                                     }
@@ -967,7 +998,11 @@ Item {
                                                                 cursorShape: Qt.PointingHandCursor
                                                                 QQC2.ToolTip.visible: hovered
                                                                 QQC2.ToolTip.text: "Open: " + modelData.path
-                                                                onClicked: Qt.openUrlExternally("file://" + modelData.path)
+                                                                onClicked: {
+                                                                    var safePath = Sec.validateFilePath(modelData.path || "");
+                                                                    if (safePath)
+                                                                        Qt.openUrlExternally("file://" + safePath);
+                                                                }
                                                             }
 
                                                         }
@@ -1065,7 +1100,7 @@ Item {
 
                                                                         required property var modelData
                                                                         required property int index
-                                                                        property bool selected: false
+                                                                        property bool selected: root.questionOptionSelected(questionCol.qId, questionItemCol.index, optionBtn.modelData.label || "")
 
                                                                         width: optBtnLabel.implicitWidth + Kirigami.Units.largeSpacing * 2
                                                                         height: optBtnLabel.implicitHeight + Kirigami.Units.smallSpacing * 2
@@ -1092,9 +1127,10 @@ Item {
                                                                             hoverEnabled: true
                                                                             cursorShape: Qt.PointingHandCursor
                                                                             onClicked: {
-                                                                                optionBtn.selected = !optionBtn.selected;
+                                                                                var nextSelected = !optionBtn.selected;
+                                                                                root.toggleQuestionOption(questionCol.qId, questionItemCol.index, optionBtn.modelData.label || "", questionItemCol.qMultiple);
                                                                                 // For non-multiple questions, submit immediately on click
-                                                                                if (!questionItemCol.qMultiple && optionBtn.selected)
+                                                                                if (!questionItemCol.qMultiple && nextSelected)
                                                                                     root.respondToQuestion(questionCol.qId, optionBtn.modelData.label || "", false);
 
                                                                             }
@@ -1553,7 +1589,7 @@ Item {
                                             Image {
                                                 anchors.fill: parent
                                                 visible: !modelData.loading && modelData.type === "image"
-                                                source: "file://" + modelData.path
+                                                source: modelData.content ? ("data:" + (modelData.mimeType || "image/png") + ";base64," + modelData.content) : ("file://" + modelData.path)
                                                 fillMode: Image.PreserveAspectCrop
                                                 clip: true
                                             }
@@ -1609,6 +1645,7 @@ Item {
                             Layout.fillWidth: true
                             Layout.minimumHeight: Kirigami.Units.gridUnit * 3
                             Layout.maximumHeight: Kirigami.Units.gridUnit * 7
+                            maximumLength: 200000
                             Layout.preferredHeight: Math.min(Layout.maximumHeight, Math.max(Layout.minimumHeight, contentHeight + topPadding + bottomPadding))
                             wrapMode: Text.WordWrap
                             clip: true
@@ -1755,7 +1792,7 @@ Item {
                             text: root.loading ? "+ Queue" : "Send"
                             Layout.minimumWidth: Kirigami.Units.gridUnit * 5
                             Layout.preferredHeight: Kirigami.Units.gridUnit * 3
-                            enabled: root.chatInputText.trim() !== "" || root.attachedFiles.length > 0
+                            enabled: root.attachmentsReadyToSend() && (root.chatInputText.trim() !== "" || root.attachedFiles.length > 0)
                             highlighted: true
                             QQC2.ToolTip.visible: hovered
                             QQC2.ToolTip.text: root.loading ? "Queue message to send after current response finishes" : "Send message"

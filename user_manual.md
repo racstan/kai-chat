@@ -86,16 +86,18 @@ KDE AI Chat supports persistent storage of API credentials across desktop sessio
 
 ### Secure KWallet Integration *(recommended)*
 - Keys are automatically encrypted and stored inside your system's secure **[KDE Wallet](https://apps.kde.org/kwalletmanager5/)** vault.
-- Communication with KWallet is handled seamlessly in the background via DBus (`qdbus6 org.kde.kwalletd6` / `qdbus org.kde.kwalletd6`).
+- Communication with KWallet is handled by the widget through KDE's native DBus API.
 - Once stored, credentials are loaded securely on widget startup without exposing keys in plaintext files.
 
 ### Plain Config Fallback
-- If KWallet is disabled or unavailable on the host system, credentials fallback to standard plain-text settings stored under your home config directory at **`~/.config/kdeaichatrc`**.
+- If KWallet is disabled or unavailable on the host system, credentials fall back to plaintext settings stored under your home config directory at **`~/.config/kdeaichatrc`**. Treat this fallback as sensitive and prefer KWallet whenever possible.
 - Values are written persistently under the `[General]` configuration group and automatically reloaded when the widget initializes.
 
 ---
 
 ## 4. Running Offline Local LLMs (Ollama, LM Studio & LiteLLM)
+
+> **MCP safety:** Configure only MCP servers you trust. Discovery and tool calls run the configured command with your user permissions; the widget does not sandbox those processes.
 
 Enjoy complete privacy and local speed by pairing the widget with offline servers!
 
@@ -236,4 +238,4 @@ Please note that Voice Tools are currently a **Beta feature**. You may encounter
 ### GPU Acceleration & NVIDIA Support Limitation
 To process voice inputs and synthesize read-aloud audio quickly, you can enable GPU acceleration in the settings.
 > [!IMPORTANT]
-> Currently, **only NVIDIA GPUs (via CUDA)** are supported for local hardware acceleration. AMD, Intel, and other GPU architectures are not supported. If you do not have an NVIDIA GPU, make sure to leave **GPU Usage** disabled in the Voice settings. Leaving it enabled without supported hardware will fail or run extremely slowly.
+> **NVIDIA GPUs via CUDA** are supported for local hardware acceleration. CPU mode works without NVIDIA; AMD and Intel GPU acceleration is not currently configured. If you do not have NVIDIA CUDA, leave **GPU Usage** disabled.

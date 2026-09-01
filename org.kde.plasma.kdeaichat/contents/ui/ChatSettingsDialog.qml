@@ -65,6 +65,12 @@ Rectangle {
         var global = cfg ? (cfg.provider || "openai") : "openai";
         var result = [{ text: "Default · " + ProviderService.getProviderDisplayName(global, cfg), value: "" }];
         var configured = ProviderService.getConfiguredProviders(cfg);
+        var walletKeys = rootRef ? (rootRef.walletApiKeys || {}) : {};
+        var supported = ProviderService.getSupportedProviders(cfg);
+        for (var w = 0; w < supported.length; w++) {
+            if (walletKeys[supported[w]] && configured.indexOf(supported[w]) < 0)
+                configured.push(supported[w]);
+        }
         for (var i = 0; i < configured.length; i++)
             result.push({ text: ProviderService.getProviderDisplayName(configured[i], cfg), value: configured[i] });
         return result;
@@ -119,8 +125,12 @@ Rectangle {
         _systemEnabled = _get("chatSystemPromptEnabled", true);
         _system = _get("chatSystemPrompt", "");
         _responseLength = _get("responseLength", 0) || 0;
-        _piProvider = rootRef && rootRef.plasmoid ? (rootRef.plasmoid.configuration.piProvider || "") : "";
-        _piModel = rootRef && rootRef.plasmoid ? (rootRef.plasmoid.configuration.piModel || "") : "";
+        var globalPiProvider = rootRef && rootRef.plasmoid ? (rootRef.plasmoid.configuration.piProvider || "") : "";
+        var globalPiModel = rootRef && rootRef.plasmoid ? (rootRef.plasmoid.configuration.piModel || "") : "";
+        _piProvider = _get("chatProvider", globalPiProvider);
+        if (!_piProvider) _piProvider = globalPiProvider;
+        _piModel = _get("chatModel", globalPiModel);
+        if (!_piModel) _piModel = globalPiModel;
         _piProviders = rootRef ? (rootRef.piProviderCandidates || []) : [];
         _piModels = rootRef && rootRef.piProviderModelMap ? (rootRef.piProviderModelMap[_piProvider] || []) : [];
         _modelCandidates = [];
@@ -262,8 +272,8 @@ Rectangle {
         var selected = _selectedProvider();
         var overrides = {
             source: _mode,
-            chatProvider: selected === (rootRef.plasmoid.configuration.provider || "openai") ? "" : selected,
-            chatModel: modelCombo.editText.trim(),
+            chatProvider: _mode === "pi" ? _piProvider : (selected === (rootRef.plasmoid.configuration.provider || "openai") ? "" : selected),
+            chatModel: _mode === "pi" ? _piModel : modelCombo.editText.trim(),
             openCodeAgent: agent,
             openCodeProvider: ocProvider,
             openCodeModel: ocModel,
@@ -476,7 +486,7 @@ Rectangle {
                         QQC2.Label { text: "Workspace"; opacity: 0.7 }
                         RowLayout {
                             Layout.fillWidth: true
-                            QQC2.TextField { id: cwdField; Layout.fillWidth: true; placeholderText: "/absolute/path"; onTextChanged: { page._ocCwd = text; if (!page._loadingDraft) page._draftDirty = true; } }
+                            QQC2.TextField { id: cwdField; Layout.fillWidth: true; maximumLength: 4096; placeholderText: "/absolute/path"; onTextChanged: { page._ocCwd = text; if (!page._loadingDraft) page._draftDirty = true; } }
                             PC3.ToolButton { icon.name: "folder"; onClicked: folderDialog.open() }
                         }
                     }
@@ -544,7 +554,7 @@ Rectangle {
                             PC3.Label { text: "Chat memory"; font.bold: true; Layout.fillWidth: true }
                             QQC2.CheckBox { id: memoryCheck; text: "On"; onCheckedChanged: { page._memoryEnabled = checked; if (!page._loadingDraft) page._draftDirty = true; } }
                         }
-                        QQC2.TextArea { id: memoryArea; Layout.fillWidth: true; Layout.preferredHeight: 80; enabled: memoryCheck.checked; wrapMode: Text.WordWrap; placeholderText: "Notes retained for this chat"; onTextChanged: { page._memory = text; if (!page._loadingDraft) page._draftDirty = true; } }
+                        QQC2.TextArea { id: memoryArea; Layout.fillWidth: true; Layout.preferredHeight: 80; maximumLength: 100000; enabled: memoryCheck.checked; wrapMode: Text.WordWrap; placeholderText: "Notes retained for this chat"; onTextChanged: { page._memory = text; if (!page._loadingDraft) page._draftDirty = true; } }
                     }
                 }
 
@@ -560,7 +570,7 @@ Rectangle {
                             PC3.Label { text: "System instructions"; font.bold: true; Layout.fillWidth: true }
                             QQC2.CheckBox { id: systemCheck; text: "On"; onCheckedChanged: { page._systemEnabled = checked; if (!page._loadingDraft) page._draftDirty = true; } }
                         }
-                        QQC2.TextArea { id: systemArea; Layout.fillWidth: true; Layout.preferredHeight: 96; enabled: systemCheck.checked; wrapMode: Text.WordWrap; placeholderText: "Instructions for this chat"; onTextChanged: { page._system = text; if (!page._loadingDraft) page._draftDirty = true; } }
+                        QQC2.TextArea { id: systemArea; Layout.fillWidth: true; Layout.preferredHeight: 96; maximumLength: 100000; enabled: systemCheck.checked; wrapMode: Text.WordWrap; placeholderText: "Instructions for this chat"; onTextChanged: { page._system = text; if (!page._loadingDraft) page._draftDirty = true; } }
                     }
                 }
 
